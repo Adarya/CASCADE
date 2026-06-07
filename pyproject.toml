@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cascade-validate"
+version = "0.3.0"
+description = "CASCADE: Clinical Assessment & Systematic Cascade for Agentic Discovery & Evaluation"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Adar Yaacov", email = "adar.yaacov@mail.huji.ac.il"},
+]
+keywords = [
+    "biomarker",
+    "validation",
+    "clinical-genomics",
+    "cancer",
+    "survival-analysis",
+    "cox-regression",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "lifelines>=0.28",
+    "scikit-learn>=1.2",
+    "statsmodels>=0.14",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+ml = ["xgboost>=1.7"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+docs = ["sphinx>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/Adarya/CASCADE"
+Repository = "https://github.com/Adarya/CASCADE"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cascade*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
