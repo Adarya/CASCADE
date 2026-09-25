@@ -29,6 +29,46 @@ try:
 except ImportError:
     independence_suite = None  # type: ignore[assignment,misc]
 
+try:
+    from cascade.pitfalls.checks.collinearity import check_collinearity
+except ImportError:
+    check_collinearity = None  # type: ignore[assignment,misc]
+
+
+# Documented independence rule: independent iff P > 0.05 AND |phi| < 0.1.
+INDEPENDENCE_P_THRESHOLD = 0.05
+INDEPENDENCE_PHI_THRESHOLD = 0.1
+
+
+def independence_decision(result: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Derive the independence decision from an independence result dict.
+
+    Works with both ``stats.equivalence.independence_suite`` output (keys
+    ``phi``, ``chi2_p``) and the fallback implementation (``phi``,
+    ``phi_p``).  Applies the documented rule: independent iff
+    ``P > 0.05`` **and** ``|phi| < 0.1``.
+
+    Returns
+    -------
+    bool or None
+        ``True`` (independent), ``False`` (not independent), or ``None``
+        if the statistics needed for the decision are unavailable.
+    """
+    if not result:
+        return None
+    phi = result.get("phi", np.nan)
+    p = result.get("phi_p", np.nan)
+    if p is None or not pd.notna(p):
+        p = result.get("chi2_p", np.nan)
+    try:
+        phi = float(phi)
+        p = float(p)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(phi) and np.isfinite(p)):
+        return None
+    return bool(p > INDEPENDENCE_P_THRESHOLD and abs(phi) < INDEPENDENCE_PHI_THRESHOLD)
+
 
 @dataclass
 class ArtifactReport:
@@ -44,8 +84,20 @@ class ArtifactReport:
         Output of ``check_baseline_confounding``.
     floor_ceiling_results : dict or None
         Output of ``check_floor_ceiling_effects``.
+    collinearity_results : list of str
+        Collinearity / VIF findings (messages) from ``check_collinearity``.
     warnings : list of str
         Human-readable warning messages from all checks.
+    checks_run : list of str
+        Names of the checks that actually executed and produced an
+        evaluable result.  The Layer 5 gate fails if this is empty.
+    critical_findings : list of str
+        Blocking findings (independence violation, covariate leakage,
+        collinearity / VIF above threshold, CRITICAL pitfall-library
+        warnings).  Also present in *warnings*.
+    pitfall_warnings : list of PitfallWarning
+        Warnings from the pitfall library (``PitfallDetector.check_all``),
+        populated when *pitfall_inputs* is passed to ``run_all``.
     """
 
     independence_results: Optional[Dict[str, Any]] = None
@@ -53,6 +105,10 @@ class ArtifactReport:
     confounding_results: Optional[Dict[str, Any]] = None
     floor_ceiling_results: Optional[Dict[str, Any]] = None
     warnings: List[str] = field(default_factory=list)
+    collinearity_results: List[str] = field(default_factory=list)
+    checks_run: List[str] = field(default_factory=list)
+    critical_findings: List[str] = field(default_factory=list)
+    pitfall_warnings: List[Any] = field(default_factory=list)
 
     @property
     def has_warnings(self) -> bool:
@@ -75,11 +131,14 @@ class ArtifactGuard:
     ----------
     checks : sequence of str, optional
         Subset of checks to run.  Valid values: ``'independence'``,
-        ``'leakage'``, ``'confounding'``, ``'floor_ceiling'``.
+        ``'leakage'``, ``'confounding'``, ``'floor_ceiling'``,
+        ``'collinearity'``.
         If ``None``, all checks are run.
     """
 
-    AVAILABLE_CHECKS = {"independence", "leakage", "confounding", "floor_ceiling"}
+    AVAILABLE_CHECKS = {
+        "independence", "leakage", "confounding", "floor_ceiling", "collinearity",
+    }
 
     def __init__(self, checks: Optional[Sequence[str]] = None) -> None:
         if checks is not None:
@@ -125,12 +184,16 @@ class ArtifactGuard:
             ``spearman_rho`` (if continuous provided), ``spearman_p``,
             ``discordant_pct``, ``independent`` (summary boolean).
         """
-        # Try CASCADE stats.equivalence first
+        # Try CASCADE stats.equivalence first.  The suite does not return an
+        # ``independent`` key, so derive it from the suite's own statistics.
         if independence_suite is not None:
             try:
-                return independence_suite(
+                suite_result = dict(independence_suite(
                     x_binary, y_binary, x_continuous, y_continuous
-                )
+                ))
+                suite_result.setdefault("phi_p", suite_result.get("chi2_p", np.nan))
+                suite_result["independent"] = independence_decision(suite_result)
+                return suite_result
             except Exception:
                 pass
 
@@ -205,7 +268,7 @@ class ArtifactGuard:
         phi_p = result.get("phi_p", np.nan)
         phi = result.get("phi", np.nan)
         if pd.notna(phi_p) and pd.notna(phi):
-            result["independent"] = (phi_p > 0.05) or (abs(phi) < 0.1)
+            result["independent"] = independence_decision(result)
         else:
             result["independent"] = None
 
@@ -434,6 +497,10 @@ class ArtifactGuard:
         max_val: Optional[float] = None,
         group_col: Optional[str] = None,
         confounding_threshold: float = 0.15,
+        collinearity_cols: Optional[Sequence[str]] = None,
+        biomarker_cols: Optional[Sequence[str]] = None,
+        vif_threshold: float = 10.0,
+        pitfall_inputs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> ArtifactReport:
         """Run all enabled artifact checks and produce a report.
@@ -459,6 +526,21 @@ class ArtifactGuard:
         group_col : str, optional
             For floor/ceiling check.
         confounding_threshold : float, default 0.15
+        collinearity_cols : sequence of str, optional
+            Feature columns for the collinearity / VIF check.  If omitted
+            but *biomarker_cols* is given, ``biomarker_cols + covariates``
+            (those present in *df*) are checked.
+        biomarker_cols : sequence of str, optional
+            See *collinearity_cols*.
+        vif_threshold : float, default 10.0
+            VIF above which a feature is flagged as collinear (blocking).
+        pitfall_inputs : dict, optional
+            Keyword arguments for :meth:`cascade.pitfalls.PitfallDetector.check_all`
+            (e.g. ``data_file``, ``feature_matrix``, ``survival_df``,
+            ``duration_col``, ``event_col``, ``biomarker_cols``,
+            ``center_col``).  When given, the pitfall library is run as part
+            of Layer 5; its warnings are added to the report and CRITICAL
+            ones are blocking.
         **kwargs
             Reserved for future checks.
 
@@ -473,28 +555,41 @@ class ArtifactGuard:
             report.independence_results = self.check_independence(
                 x_binary, y_binary, x_continuous, y_continuous
             )
-            if report.independence_results.get("independent") is False:
+            decision = independence_decision(report.independence_results)
+            report.independence_results["independent"] = decision
+            if decision is not None:
+                report.checks_run.append("independence")
+            else:
                 report.warnings.append(
-                    f"Variables may NOT be independent: "
-                    f"phi={report.independence_results.get('phi', 'N/A'):.3f}, "
-                    f"P={report.independence_results.get('phi_p', 'N/A')}"
+                    "Independence check inconclusive (insufficient data); "
+                    "not counted as an evaluated check."
                 )
+            if decision is False:
+                msg = (
+                    f"CRITICAL: Variables may NOT be independent: "
+                    f"phi={_fmt(report.independence_results.get('phi'))}, "
+                    f"P={_fmt(report.independence_results.get('phi_p'))}"
+                )
+                report.warnings.append(msg)
+                report.critical_findings.append(msg)
 
         # Leakage
         if "leakage" in self.checks and landmark_col is not None and covariates is not None:
             report.leakage_results = self.check_covariate_leakage(
                 df, landmark_col, covariates, **kwargs
             )
+            report.checks_run.append("leakage")
             if report.leakage_results:
-                report.warnings.append(
-                    f"Potential covariate leakage in: {report.leakage_results}"
-                )
+                msg = f"CRITICAL: Potential covariate leakage in: {report.leakage_results}"
+                report.warnings.append(msg)
+                report.critical_findings.append(msg)
 
         # Confounding
         if "confounding" in self.checks and adjusted_hr is not None and unadjusted_hr is not None:
             confounded = self.check_baseline_confounding(
                 df, adjusted_hr, unadjusted_hr, confounding_threshold
             )
+            report.checks_run.append("confounding")
             report.confounding_results = {
                 "confounded": confounded,
                 "adjusted_hr": adjusted_hr,
@@ -513,6 +608,7 @@ class ArtifactGuard:
             report.floor_ceiling_results = self.check_floor_ceiling_effects(
                 df, variable_col, min_val, max_val, group_col
             )
+            report.checks_run.append("floor_ceiling")
             fc = report.floor_ceiling_results
             if fc["floor_pct"] > 25:
                 report.warnings.append(
@@ -523,4 +619,52 @@ class ArtifactGuard:
                     f"Ceiling effect: {fc['ceiling_pct']:.1f}% at maximum ({max_val})"
                 )
 
+        # Collinearity / VIF
+        if collinearity_cols is None and biomarker_cols is not None:
+            collinearity_cols = list(biomarker_cols) + list(covariates or [])
+        if "collinearity" in self.checks and collinearity_cols is not None:
+            cols = [c for c in dict.fromkeys(collinearity_cols) if c in df.columns]
+            X = df[cols].select_dtypes(include=[np.number]).dropna()
+            if check_collinearity is None:
+                report.warnings.append("Collinearity check unavailable (import failed).")
+            elif X.shape[1] < 2 or X.shape[0] <= X.shape[1]:
+                report.warnings.append(
+                    "Collinearity check not evaluable (need >= 2 numeric features "
+                    "and more rows than features)."
+                )
+            else:
+                findings = check_collinearity(X, vif_threshold=vif_threshold)
+                report.checks_run.append("collinearity")
+                report.collinearity_results = [f.message for f in findings]
+                for f in findings:
+                    msg = f"CRITICAL: Collinearity: {f.message}"
+                    report.warnings.append(msg)
+                    report.critical_findings.append(msg)
+
+        # Pitfall library (PitfallDetector)
+        if pitfall_inputs:
+            from cascade.pitfalls import PitfallDetector
+            from cascade.pitfalls.library import Severity
+
+            pitfall_warnings = PitfallDetector().check_all(**pitfall_inputs)
+            report.checks_run.append("pitfall_library")
+            report.pitfall_warnings = list(pitfall_warnings)
+            for w in pitfall_warnings:
+                msg = (
+                    f"Pitfall #{w.pitfall.id} ({w.pitfall.name}) at "
+                    f"{w.location}: {w.message}"
+                )
+                if w.severity == Severity.CRITICAL:
+                    msg = f"CRITICAL: {msg}"
+                    report.critical_findings.append(msg)
+                report.warnings.append(msg)
+
         return report
+
+
+def _fmt(value: Any) -> str:
+    """Format a statistic for a warning message without crashing on None/str."""
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return "N/A"

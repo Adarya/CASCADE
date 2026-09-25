@@ -231,13 +231,16 @@ class TestSensitivityGate:
 
 class TestArtifactGuardGate:
     def test_pass_no_warnings(self):
-        report = ArtifactReport()
+        # A check must actually have run for the gate to pass (fail-closed).
+        report = ArtifactReport(checks_run=["leakage"])
         lr = LayerResult("artifact_guard", 5, "completed", results=report)
         gate = GateEvaluator().evaluate("artifact_guard", lr)
         assert gate.passed is True
 
     def test_pass_noncritical_warning(self):
-        report = ArtifactReport(warnings=["WARNING: Minor issue detected"])
+        report = ArtifactReport(
+            warnings=["WARNING: Minor issue detected"], checks_run=["floor_ceiling"]
+        )
         lr = LayerResult("artifact_guard", 5, "completed", results=report)
         gate = GateEvaluator().evaluate("artifact_guard", lr)
         assert gate.passed is True

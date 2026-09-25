@@ -79,6 +79,7 @@ class TestAgentDecisionLog:
         assert set(df.columns) == {
             "timestamp", "study", "layer", "decision_type",
             "description", "rationale", "outcome", "automated",
+            "overridden", "original_choice", "override_choice", "override_reason",
         }
 
     def test_to_dataframe_empty(self):

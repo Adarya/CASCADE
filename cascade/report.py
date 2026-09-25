@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 
@@ -78,10 +79,7 @@ def generate_report(pipeline_result) -> str:
                 break
 
         if matching:
-            status_icon = {
-                "completed": "PASS",
-                "skipped": "SKIP",
-            }.get(matching.status, "FAIL")
+            status_icon = _layer_status(matching)
             duration = f"{matching.duration_seconds:.1f}s"
             lines.append(f"| {layer_num} | {name} | {status_icon} | {duration} |")
         else:
@@ -94,10 +92,7 @@ def generate_report(pipeline_result) -> str:
         if lr.layer_number not in range(9)
     ]
     for lr in custom:
-        status_icon = {
-            "completed": "PASS",
-            "skipped": "SKIP",
-        }.get(lr.status, "FAIL")
+        status_icon = _layer_status(lr)
         lines.append(
             f"| + | {lr.layer_name} (custom) | {status_icon} | "
             f"{lr.duration_seconds:.1f}s |"
@@ -105,11 +100,36 @@ def generate_report(pipeline_result) -> str:
 
     lines.append("")
 
-    # Completed layers
-    completed = pipeline_result.completed_layers
+    # Completed layers: only the 9 core layers count against /9; custom
+    # layers are listed separately.
+    core_completed = {
+        lr.layer_number
+        for lr in pipeline_result.layer_results.values()
+        if lr.succeeded and lr.layer_number in range(9)
+    }
     total_possible = 9
-    pct = len(completed) / total_possible * 100 if total_possible > 0 else 0
-    lines.append(f"**Completion: {len(completed)}/{total_possible} layers ({pct:.0f}%)**")
+    pct = len(core_completed) / total_possible * 100
+    lines.append(
+        f"**Completion: {len(core_completed)}/{total_possible} core layers ({pct:.0f}%)**"
+    )
+    custom_completed = [lr.layer_name for lr in custom if lr.succeeded]
+    if custom:
+        lines.append(
+            f"\nCustom layers (not counted above): "
+            f"{len(custom_completed)}/{len(custom)} completed"
+            + (f" ({', '.join(custom_completed)})" if custom_completed else "")
+        )
+    gates = [
+        lr.metadata.get("gate") for lr in pipeline_result.layer_results.values()
+        if lr.metadata.get("gate") is not None
+    ]
+    gated = [
+        g for g in gates
+        if not g.details.get("skipped") and not g.details.get("not_gated")
+    ]
+    if gated:
+        n_pass = sum(1 for g in gated if g.passed)
+        lines.append(f"\n**Gates: {n_pass}/{len(gated)} gates passed.**")
     lines.append("")
 
     # Warnings
@@ -179,6 +199,8 @@ def generate_report(pipeline_result) -> str:
 
             if getattr(gate, "details", {}).get("skipped"):
                 status = "SKIP"
+            elif getattr(gate, "details", {}).get("not_gated"):
+                status = "NOT GATED"
             elif gate.passed:
                 status = "PASS"
             else:
@@ -211,8 +233,124 @@ def generate_report(pipeline_result) -> str:
     return "\n".join(lines)
 
 
-def _generate_checklist(pipeline_result) -> str:
-    """Generate a REMARK-style checklist for CASCADE compliance."""
+def _layer_status(lr) -> str:
+    """Status shown in the layer table; reflects the gate when one ran."""
+    if lr.status == "skipped":
+        return "SKIP"
+    if lr.status != "completed":
+        return "FAIL"
+    gate = lr.metadata.get("gate")
+    if gate is None:
+        return "DONE (not gated)"
+    details = getattr(gate, "details", {}) or {}
+    if details.get("skipped"):
+        return "DONE (gate skipped)"
+    if details.get("not_gated"):
+        return "DONE (not gated)"
+    if gate.passed:
+        return "PASS (remediated)" if getattr(gate, "remediation_succeeded", False) else "PASS"
+    return "FAIL (gate)"
+
+
+def _df(results) -> Optional[pd.DataFrame]:
+    return results if isinstance(results, pd.DataFrame) and not results.empty else None
+
+
+def _has_cols(results, *cols) -> bool:
+    df = _df(results)
+    return df is not None and all(c in df.columns for c in cols)
+
+
+def _has_keys(results, *keys) -> bool:
+    return isinstance(results, dict) and all(
+        k in results and results[k] is not None for k in keys
+    )
+
+
+def _finite(v) -> bool:
+    try:
+        return bool(np.isfinite(float(v)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _ev_robust_no_flips(lr) -> bool:
+    df = _df(lr.results)
+    if df is None or not {"robustness_class", "n_evaluable", "n_concordant"} <= set(df.columns):
+        return False
+    robust = df[df["robustness_class"] == "robust"]
+    return bool((robust["n_concordant"] == robust["n_evaluable"]).all())
+
+
+def _ev_artifact(check: str):
+    def _f(lr) -> bool:
+        return check in (getattr(lr.results, "checks_run", None) or [])
+    return _f
+
+
+def _ev_independence(lr) -> bool:
+    res = getattr(lr.results, "independence_results", None)
+    return "independence" in (getattr(lr.results, "checks_run", None) or []) and bool(res)
+
+
+# Evidence required, from the layer's own results, before a checklist item
+# is ticked.  ``None`` = not verifiable from pipeline results (attest manually).
+_CHECKLIST_EVIDENCE = {
+    "Cohort defined with inclusion/exclusion criteria": None,
+    "Data quality guards applied (comment headers, hex colors)": None,
+    "Time-dependent features locked to anchor dates": None,
+    "Hypothesis space systematically enumerated": lambda lr: _df(lr.results) is not None,
+    "Multiple testing correction applied (FDR or Bonferroni)":
+        lambda lr: _has_cols(lr.results, "p_adjusted"),
+    "Separation problems filtered (CI ratio check)": None,
+    "Minimum subgroup sizes enforced": None,
+    "Orthogonal statistical method applied": lambda lr: _df(lr.results) is not None,
+    "Cross-analysis concordance computed":
+        lambda lr: _has_cols(lr.results, "direction_match")
+        or _has_cols(lr.results, "concordance_direction")
+        or _has_keys(lr.results, "direction_concordance"),
+    "Both-significant findings identified":
+        lambda lr: _has_cols(lr.results, "confidence_tier")
+        or _has_cols(lr.results, "both_significant")
+        or _has_keys(lr.results, "n_both_significant"),
+    "Gene x treatment interaction formally tested":
+        lambda lr: _has_cols(lr.results, "interaction_p"),
+    "Stratified effects reported (treated vs untreated)":
+        lambda lr: _has_cols(lr.results, "hr_treated", "hr_untreated"),
+    "Sensitivity analyses span >= 3 categories":
+        lambda lr: len(set((lr.metadata.get("variant_categories") or {}).values())) >= 3,
+    "Robustness classification assigned (robust/exploratory/unstable)":
+        lambda lr: _has_cols(lr.results, "robustness_class")
+        and bool(lr.results["robustness_class"].notna().all()),
+    "No direction flips in robust findings": _ev_robust_no_flips,
+    "Independence of combined features tested": _ev_independence,
+    "Covariate leakage checked": _ev_artifact("leakage"),
+    "Collinearity/VIF assessed": _ev_artifact("collinearity"),
+    "Baseline confounding evaluated": _ev_artifact("confounding"),
+    "Landmark analysis at clinically relevant timepoints": None,
+    "Cross-validated (not training-set) C-statistics reported":
+        lambda lr: isinstance(lr.results, dict)
+        and _finite(lr.results.get("delta_c", lr.results.get("mean_delta_c"))),
+    "Risk groups with KM curves constructed": None,
+    "Independent cohort validation performed": lambda lr: lr.results is not None,
+    "Balanced accuracy (not just accuracy) reported":
+        lambda lr: isinstance(lr.results, dict)
+        and _finite(lr.results.get("balanced_accuracy")),
+    "Citations screened for format/plausibility issues (manual verification still required)": None,
+    "Display item count within journal limits": None,
+}
+
+
+def _generate_checklist(pipeline_result, attested: bool = False) -> str:
+    """Generate a REMARK-style checklist for CASCADE compliance.
+
+    An item is ticked only when the corresponding layer completed, its gate
+    (if any) did not fail, and the layer's results contain evidence for that
+    specific item.  Items that cannot be verified from pipeline results are
+    left unticked and marked for manual attestation.  With ``attested=True``
+    (standalone checklist), every item of a completed layer is ticked on the
+    caller's attestation.
+    """
     checklist_items = [
         (0, "Cohort defined with inclusion/exclusion criteria"),
         (0, "Data quality guards applied (comment headers, hex colors)"),
@@ -242,17 +380,38 @@ def _generate_checklist(pipeline_result) -> str:
         (8, "Display item count within journal limits"),
     ]
 
-    completed_layers = set()
+    completed: Dict[int, Any] = {}
     for lr in pipeline_result.layer_results.values():
-        if lr.succeeded:
-            completed_layers.add(lr.layer_number)
+        if lr.succeeded and lr.layer_number in range(9):
+            completed.setdefault(lr.layer_number, lr)
 
     lines = []
     for layer_num, item in checklist_items:
-        if layer_num in completed_layers:
-            lines.append(f"- [x] **L{layer_num}**: {item}")
+        lr = completed.get(layer_num)
+        note = ""
+        if lr is None:
+            ticked = False
+        elif attested:
+            ticked = True
         else:
-            lines.append(f"- [ ] **L{layer_num}**: {item}")
+            gate = lr.metadata.get("gate")
+            gate_failed = gate is not None and not gate.passed
+            evidence = _CHECKLIST_EVIDENCE.get(item)
+            if evidence is None:
+                ticked = False
+                note = " _(not verifiable from pipeline results; attest manually)_"
+            elif gate_failed:
+                ticked = False
+                note = " _(layer gate FAILED)_"
+            else:
+                try:
+                    ticked = bool(evidence(lr))
+                except Exception:
+                    ticked = False
+                if not ticked:
+                    note = " _(no supporting evidence in results)_"
+        box = "x" if ticked else " "
+        lines.append(f"- [{box}] **L{layer_num}**: {item}{note}")
 
     return "\n".join(lines)
 
@@ -283,4 +442,5 @@ def generate_standalone_checklist(completed_layers: Dict[int, bool]) -> str:
             )
             pr.layer_results[f"layer_{layer_num}"] = lr
 
-    return _generate_checklist(pr)
+    # Standalone use: completion is attested by the caller, not evidenced.
+    return _generate_checklist(pr, attested=True)

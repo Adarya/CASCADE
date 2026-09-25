@@ -105,6 +105,15 @@ STUDY_TYPE_OVERRIDES: Dict[str, Dict[str, Optional[Dict[str, Any]]]] = {
     "general": {},
 }
 
+def _finite_or_none(value: Any) -> Optional[float]:
+    """Return *value* as a float if it is a finite number, else ``None``."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
+
+
 # Layer number lookup
 _LAYER_NUMBERS = {
     "cohort": 0,
@@ -200,6 +209,18 @@ class GateEvaluator:
         layer_num = _LAYER_NUMBERS.get(layer_name, -1)
 
         gate_config = self._gates.get(layer_name)
+        if layer_name not in self._gates:
+            # Custom / ungated layer (cohort, manuscript, user layers): mark
+            # as not gated so it is excluded from the pass tally.
+            return GateResult(
+                layer_name=layer_name,
+                layer_number=layer_num,
+                passed=True,
+                details={
+                    "not_gated": True,
+                    "info": f"No gate defined for layer '{layer_name}'.",
+                },
+            )
         if gate_config is None:
             return GateResult(
                 layer_name=layer_name,
@@ -228,11 +249,15 @@ class GateEvaluator:
         }.get(layer_name)
 
         if evaluator is None:
+            # Not gated: reported as such and excluded from the pass tally.
             return GateResult(
                 layer_name=layer_name,
                 layer_number=layer_num,
                 passed=True,
-                details={"info": f"No gate defined for layer '{layer_name}'."},
+                details={
+                    "not_gated": True,
+                    "info": f"No gate defined for layer '{layer_name}'.",
+                },
             )
 
         try:
@@ -345,23 +370,45 @@ class GateEvaluator:
     def _evaluate_predictive(
         self, results: Any, config: Dict[str, Any], layer_num: int
     ) -> GateResult:
-        """Layer 3: Every significant biomarker classified as PREDICTIVE or PROGNOSTIC."""
-        criteria = {"all_classified": True}
+        """Layer 3: Every biomarker classified as PREDICTIVE, PROGNOSTIC,
+        UNDERPOWERED or NOT_EVALUABLE; fails if the table is empty or no
+        biomarker was evaluable."""
+        criteria = {"all_classified": True, "min_evaluable": 1}
 
         if isinstance(results, pd.DataFrame) and "classification" in results.columns:
             n_total = len(results)
-            n_classified = results["classification"].notna().sum()
-            valid_classes = {"predictive", "prognostic", "underpowered",
-                            "PREDICTIVE", "PROGNOSTIC", "UNDERPOWERED"}
-            n_valid = results["classification"].isin(valid_classes).sum()
-            actual = {"n_total": n_total, "n_classified": int(n_classified), "n_valid": int(n_valid)}
-            passed = bool(n_classified == n_total and n_valid == n_total)
+            cls = results["classification"]
+            n_classified = cls.notna().sum()
+            valid_classes = {"predictive", "prognostic", "underpowered", "not_evaluable"}
+            cls_lower = cls.astype(str).str.lower()
+            n_valid = (cls.notna() & cls_lower.isin(valid_classes)).sum()
+            n_not_evaluable = int((cls.notna() & (cls_lower == "not_evaluable")).sum())
+            actual = {
+                "n_total": n_total,
+                "n_classified": int(n_classified),
+                "n_valid": int(n_valid),
+                "n_not_evaluable": n_not_evaluable,
+            }
+            passed = bool(
+                n_total > 0
+                and n_classified == n_total
+                and n_valid == n_total
+                and n_not_evaluable < n_total
+            )
+            if n_total == 0:
+                message = "No biomarkers to classify (empty result)."
+            elif n_valid != n_total or n_classified != n_total:
+                message = "Not all biomarkers classified."
+            else:
+                message = "No biomarker was evaluable (all 'not_evaluable')."
         elif isinstance(results, dict) and "all_classified" in results:
             actual = {"all_classified": results["all_classified"]}
             passed = bool(results["all_classified"])
+            message = "Not all biomarkers classified."
         else:
             actual = {}
             passed = False
+            message = "No 'classification' column in results."
 
         return GateResult(
             layer_name="predictive",
@@ -369,26 +416,44 @@ class GateEvaluator:
             passed=passed,
             criteria=criteria,
             actual=actual,
-            error_message=None if passed else "Not all biomarkers classified.",
+            error_message=None if passed else message,
         )
 
     def _evaluate_sensitivity(
         self, results: Any, config: Dict[str, Any], layer_num: int
     ) -> GateResult:
-        """Layer 4: All findings have robustness classifications."""
+        """Layer 4: All findings have robustness classifications.
+
+        Fails closed: an empty result, a result without a robustness
+        classification, or a classification in which no sensitivity variant
+        was evaluable for any finding all fail the gate.
+        """
         criteria = {"all_scored": True}
+        message = "Not all findings scored for robustness."
 
         if isinstance(results, pd.DataFrame) and "robustness_class" in results.columns:
             n_total = len(results)
             n_scored = results["robustness_class"].notna().sum()
             actual = {"n_total": n_total, "n_scored": int(n_scored)}
-            passed = bool(n_scored == n_total)
+            passed = bool(n_total > 0 and n_scored == n_total)
+            if n_total == 0:
+                message = "No findings to score (empty result)."
+            elif passed and "n_evaluable" in results.columns:
+                n_eval = pd.to_numeric(results["n_evaluable"], errors="coerce").fillna(0)
+                actual["n_with_evaluable_variants"] = int((n_eval > 0).sum())
+                if not (n_eval > 0).any():
+                    passed = False
+                    message = "No sensitivity variant was evaluable for any finding."
         elif isinstance(results, dict) and "all_scored" in results:
             actual = {"all_scored": results["all_scored"]}
             passed = bool(results["all_scored"])
         else:
             actual = {}
-            passed = True  # Permissive if can't check
+            passed = False
+            message = (
+                "No robustness classification in results "
+                "(expected a 'robustness_class' column)."
+            )
 
         return GateResult(
             layer_name="sensitivity",
@@ -396,34 +461,86 @@ class GateEvaluator:
             passed=passed,
             criteria=criteria,
             actual=actual,
-            error_message=None if passed else "Not all findings scored for robustness.",
+            error_message=None if passed else message,
         )
 
     def _evaluate_artifact_guard(
         self, results: Any, config: Dict[str, Any], layer_num: int
     ) -> GateResult:
-        """Layer 5: No unresolved CRITICAL artifacts."""
-        criteria = {"no_unresolved_critical": True}
+        """Layer 5: No unresolved critical artifacts.
+
+        Critical artifacts are derived from the report's actual findings:
+        an independence violation, covariate leakage, or collinearity /
+        VIF above threshold (plus any warning explicitly tagged CRITICAL).
+        Fails closed if no check actually ran.
+        """
+        criteria = {"no_unresolved_critical": True, "min_checks_run": 1}
 
         if hasattr(results, "warnings"):
+            from cascade.core.artifact_guard import independence_decision
+
             warnings_list = results.warnings if isinstance(results.warnings, list) else []
-            critical_warnings = [w for w in warnings_list if "CRITICAL" in str(w).upper()]
-            n_critical = len(critical_warnings)
+            findings: List[str] = []
+            checks_run = list(getattr(results, "checks_run", None) or [])
+
+            indep = getattr(results, "independence_results", None)
+            if indep:
+                decision = indep.get("independent")
+                if decision is None:
+                    decision = independence_decision(indep)
+                if decision is not None and "independence" not in checks_run:
+                    checks_run.append("independence")
+                if decision is False:
+                    findings.append("independence violation")
+            leakage = getattr(results, "leakage_results", None) or []
+            if leakage:
+                findings.append(f"covariate leakage: {list(leakage)}")
+                if "leakage" not in checks_run:
+                    checks_run.append("leakage")
+            collinear = getattr(results, "collinearity_results", None) or []
+            if collinear:
+                findings.append(f"collinearity/VIF: {len(collinear)} finding(s)")
+                if "collinearity" not in checks_run:
+                    checks_run.append("collinearity")
+            for attr, check in (("confounding_results", "confounding"),
+                                ("floor_ceiling_results", "floor_ceiling")):
+                if getattr(results, attr, None) is not None and check not in checks_run:
+                    checks_run.append(check)
+
+            # Warnings tagged CRITICAL that are not already covered above.
+            known = set(getattr(results, "critical_findings", None) or [])
+            extra = [
+                w for w in warnings_list
+                if "CRITICAL" in str(w).upper() and w not in known
+            ]
+            n_critical = len(findings) + len(extra)
             actual = {
                 "n_warnings": len(warnings_list),
                 "n_critical": n_critical,
+                "checks_run": checks_run,
+                "critical_findings": findings + [str(w) for w in extra],
             }
-            passed = n_critical == 0
-        elif hasattr(results, "has_warnings"):
-            actual = {"has_warnings": results.has_warnings}
-            passed = not results.has_warnings
-        elif isinstance(results, dict):
-            n_critical = results.get("n_critical", 0)
+            if not checks_run and not extra:
+                passed = False
+                message = "No artifact check actually ran; cannot certify Layer 5."
+            else:
+                passed = n_critical == 0
+                message = (
+                    f"{n_critical} critical artifact(s) unresolved: "
+                    + "; ".join(actual["critical_findings"])
+                )
+        elif isinstance(results, dict) and "n_critical" in results:
+            n_critical = results.get("n_critical")
             actual = {"n_critical": n_critical}
             passed = n_critical == 0
+            message = f"{n_critical} critical artifact(s) unresolved."
         else:
             actual = {}
-            passed = True
+            passed = False
+            message = (
+                f"Unrecognised artifact-guard result "
+                f"({type(results).__name__}); cannot certify Layer 5."
+            )
 
         return GateResult(
             layer_name="artifact_guard",
@@ -431,7 +548,7 @@ class GateEvaluator:
             passed=passed,
             criteria=criteria,
             actual=actual,
-            error_message=None if passed else f"{actual.get('n_critical', '?')} critical artifact(s) unresolved.",
+            error_message=None if passed else message,
         )
 
     def _evaluate_clinical(
@@ -444,17 +561,28 @@ class GateEvaluator:
         if isinstance(results, dict):
             delta_c = results.get("delta_c", results.get("mean_delta_c", np.nan))
             ci = results.get("ci", results.get("ci_95", (np.nan, np.nan)))
-            if isinstance(ci, (list, tuple)) and len(ci) >= 2:
+            if isinstance(ci, (list, tuple, np.ndarray)) and len(ci) >= 2:
                 ci_lower, ci_upper = ci[0], ci[1]
             else:
                 ci_lower, ci_upper = np.nan, np.nan
 
             actual = {"delta_c": delta_c, "ci_lower": ci_lower, "ci_upper": ci_upper}
 
-            if pd.notna(delta_c) and delta_c <= 0:
-                failures.append(f"delta_c = {delta_c:.4f} <= 0")
-            if pd.notna(ci_lower) and ci_lower <= 0:
-                failures.append(f"CI lower = {ci_lower:.4f} includes zero")
+            # Fail closed: require a finite delta-C AND a finite CI whose
+            # lower bound is > 0.
+            delta_c_f = _finite_or_none(delta_c)
+            ci_lower_f = _finite_or_none(ci_lower)
+            ci_upper_f = _finite_or_none(ci_upper)
+            if delta_c_f is None:
+                failures.append(f"delta_c missing or non-finite ({delta_c!r})")
+            elif delta_c_f <= 0:
+                failures.append(f"delta_c = {delta_c_f:.4f} <= 0")
+            if ci_lower_f is None or ci_upper_f is None:
+                failures.append(
+                    f"95% CI missing or non-finite ({ci_lower!r}, {ci_upper!r})"
+                )
+            elif ci_lower_f <= 0:
+                failures.append(f"CI lower = {ci_lower_f:.4f} includes zero")
         else:
             actual = {}
             failures.append(f"Unexpected result type: {type(results).__name__}")
@@ -523,6 +651,8 @@ class GateEvaluator:
         for gr in sorted(gate_results, key=lambda g: g.layer_number):
             if gr.details.get("skipped"):
                 status = "SKIP"
+            elif gr.details.get("not_gated"):
+                status = "NOT GATED"
             elif gr.passed:
                 status = "PASS"
                 n_passed += 1
