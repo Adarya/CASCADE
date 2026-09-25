@@ -68,6 +68,38 @@ def _is_continuous(series: pd.Series) -> bool:
     return not set(np.asarray(vals, dtype=float).tolist()).issubset({0.0, 1.0})
 
 
+
+def _parse_event_column(df: pd.DataFrame, event_col: Optional[str]) -> pd.DataFrame:
+    """Return *df* with a non-numeric event column parsed to 1/0/NaN.
+
+    Accepts cBioPortal status strings (``'1:DECEASED'``, ``'0:LIVING'``)
+    and booleans; numeric columns are returned unchanged.
+    """
+    if event_col is None or event_col not in df.columns:
+        return df
+    if pd.api.types.is_numeric_dtype(df[event_col]) and not pd.api.types.is_bool_dtype(df[event_col]):
+        return df
+    from cascade.core.cohort import parse_event_status
+
+    df = df.copy()
+    df[event_col] = df[event_col].map(parse_event_status)
+    return df
+
+
+def _encode_categorical(sub: pd.DataFrame, covariates: List[str]):
+    """Dummy-encode non-numeric covariates (first level as reference).
+
+    Returns the frame with encoded columns and the updated covariate list.
+    """
+    cat = [c for c in covariates
+           if c in sub.columns and not pd.api.types.is_numeric_dtype(sub[c])]
+    if not cat:
+        return sub, covariates
+    dummies = pd.get_dummies(sub[cat].astype(str), prefix=cat, drop_first=True, dtype=float)
+    sub = pd.concat([sub.drop(columns=cat), dummies], axis=1)
+    covs = [c for c in covariates if c not in cat] + list(dummies.columns)
+    return sub, covs
+
 class BiomarkerScreen:
     """High-throughput biomarker screening with multiple-testing correction.
 
@@ -164,6 +196,7 @@ class BiomarkerScreen:
             raise ValueError(
                 f"event_col is required for method='{self.method}'."
             )
+        df = _parse_event_column(df, event_col)
         results: List[Dict[str, Any]] = []
 
         for col in biomarker_cols:
@@ -281,6 +314,7 @@ class BiomarkerScreen:
         ev_col = outcome_col if (self.method == "logistic" or event_col is None) else event_col
         all_cols = list(dict.fromkeys([outcome_col, ev_col, biomarker_col] + covs))
         sub = df[all_cols].dropna()
+        sub, covs = _encode_categorical(sub, covs)
 
         row: Dict[str, Any] = {"biomarker": biomarker_col}
 
@@ -346,8 +380,9 @@ class BiomarkerScreen:
                 ci_upper=s["exp(coef) upper 95%"],
                 p=s["p"],
             )
-        except Exception:
-            return dict(hr=np.nan, ci_lower=np.nan, ci_upper=np.nan, p=np.nan)
+        except Exception as exc:
+            return dict(hr=np.nan, ci_lower=np.nan, ci_upper=np.nan, p=np.nan,
+                        fit_error=f"{type(exc).__name__}: {exc}")
 
     def _fit_logistic(
         self,
@@ -377,8 +412,9 @@ class BiomarkerScreen:
                 ci_upper=np.exp(ci[1]),
                 p=model.pvalues[biomarker_col],
             )
-        except Exception:
-            return dict(hr=np.nan, ci_lower=np.nan, ci_upper=np.nan, p=np.nan)
+        except Exception as exc:
+            return dict(hr=np.nan, ci_lower=np.nan, ci_upper=np.nan, p=np.nan,
+                        fit_error=f"{type(exc).__name__}: {exc}")
 
     # ------------------------------------------------------------------
     # Helpers

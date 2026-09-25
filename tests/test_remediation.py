@@ -113,7 +113,7 @@ class TestRemediation:
         assert gate.remediation_attempted is False
 
     def test_pipeline_without_gates_unchanged(self):
-        pipeline = Pipeline()  # No gate evaluator at all
+        pipeline = Pipeline(gate_evaluator=False)  # gates explicitly off
         mock_screen = _MockScreen(n_significant=0)
         pipeline.add_layer("discovery", mock_screen)
 

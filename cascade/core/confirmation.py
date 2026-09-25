@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats as sp_stats
 
-from cascade.core.discovery import BiomarkerScreen
+from cascade.core.discovery import BiomarkerScreen, _parse_event_column
 
 
 class OrthogonalConfirm:
@@ -111,6 +111,7 @@ class OrthogonalConfirm:
         """
         if self.confirm_method == "logistic":
             binary_col = event_col if event_col is not None else outcome_col
+            df = _parse_event_column(df, binary_col)
         elif event_col is None:
             raise ValueError(
                 f"event_col is required for confirm_method='{self.confirm_method}'."

@@ -365,7 +365,7 @@ class TestGatePipelineIntegration:
     def test_pipeline_without_gates(self, survival_df, biomarker_cols, covariates):
         from cascade.core import BiomarkerScreen
 
-        pipeline = Pipeline()  # No gate_evaluator
+        pipeline = Pipeline(gate_evaluator=False)  # gates explicitly off
         screen = BiomarkerScreen(
             method="cox", correction="fdr_tsbh",
             min_exposed=10, min_events=3,

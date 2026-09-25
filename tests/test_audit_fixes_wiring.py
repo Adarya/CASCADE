@@ -51,3 +51,43 @@ def test_layer5_pitfall_warnings_reach_compliance_report():
     lr = result.layer_results["artifact_guard"]
     assert any("Pitfall #10" in w for w in lr.warnings)
     assert "Pitfall #10" in generate_report(result)
+
+
+def test_pipeline_gates_on_by_default_and_parses_cbioportal_status():
+    from cascade.core import BiomarkerScreen
+
+    rng = np.random.default_rng(1)
+    n = 600
+    df = pd.DataFrame({f"G{i}": rng.binomial(1, 0.25, n) for i in range(4)})
+    t = rng.exponential(24 * np.exp(-0.7 * df["G0"]))
+    c = rng.exponential(40, n)
+    df["OS_MONTHS"] = np.minimum(t, c)
+    df["OS_STATUS"] = np.where(t <= c, "1:DECEASED", "0:LIVING")
+    pipe = Pipeline()
+    pipe.add_layer("discovery", BiomarkerScreen(method="cox", min_exposed=20, min_events=5))
+    result = pipe.run(df, biomarker_cols=[f"G{i}" for i in range(4)],
+                      outcome_col="OS_MONTHS", event_col="OS_STATUS")
+    lr = result.layer_results["discovery"]
+    assert lr.succeeded
+    assert "gate" in lr.metadata
+
+
+def test_confirmation_parses_cbioportal_status_and_categorical_covariates():
+    from cascade.core import BiomarkerScreen, OrthogonalConfirm
+
+    rng = np.random.default_rng(2)
+    n = 800
+    df = pd.DataFrame({f"G{i}": rng.binomial(1, 0.25, n) for i in range(3)})
+    df["AGE"] = rng.normal(65, 9, n)
+    df["SEX"] = rng.choice(["Male", "Female"], n)
+    t = rng.exponential(24 * np.exp(-0.7 * df["G0"]))
+    c = rng.exponential(40, n)
+    df["OS_MONTHS"] = np.minimum(t, c)
+    df["OS_STATUS"] = np.where(t <= c, "1:DECEASED", "0:LIVING")
+    genes = ["G0", "G1", "G2"]
+    primary = BiomarkerScreen(method="cox", min_exposed=20, min_events=5).screen(
+        df, genes, "OS_MONTHS", "OS_STATUS", covariates=["AGE", "SEX"])
+    assert primary.loc[primary.biomarker == "G0", "p"].iloc[0] < 0.05
+    conf = OrthogonalConfirm(confirm_method="logistic").confirm(
+        primary, df, genes, "OS_MONTHS", event_col="OS_STATUS", covariates=["AGE", "SEX"])
+    assert conf["confirm_p"].notna().all() if "confirm_p" in conf else len(conf) == 3

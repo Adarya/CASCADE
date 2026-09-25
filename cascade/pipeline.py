@@ -144,6 +144,14 @@ class Pipeline:
     ) -> None:
         self._layers: OrderedDict[str, Any] = OrderedDict()
         self._result: Optional[PipelineResult] = None
+        # Gates are on by default (CASCADE layers are gated); pass
+        # gate_evaluator=False to run the layers without decision gates.
+        if gate_evaluator is None:
+            from cascade.core.gates import GateEvaluator
+
+            gate_evaluator = GateEvaluator()
+        elif gate_evaluator is False:
+            gate_evaluator = None
         self._gate_evaluator = gate_evaluator
         self._remediation_strategies = remediation_strategies or {}
         self._agent_log = agent_log
