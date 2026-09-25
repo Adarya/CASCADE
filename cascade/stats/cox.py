@@ -17,7 +17,33 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
+from lifelines.exceptions import ConvergenceWarning
 from lifelines.utils import concordance_index
+
+
+def fit_recording_convergence(fitter: Any, data: pd.DataFrame, **fit_kwargs: Any) -> List[str]:
+    """Fit a lifelines model and return any ``ConvergenceWarning`` messages.
+
+    ``fitter.fit(data, **fit_kwargs)`` is called with warnings recorded.
+    Lifelines ``ConvergenceWarning`` messages (Newton-Raphson failure,
+    near-separation, near-singular / low-variance columns) are returned
+    instead of being silently printed, so callers can mark the fit as
+    not converged.  All other warnings are re-emitted unchanged.
+    Exceptions raised by ``fit`` propagate.
+    """
+    caught: List[warnings.WarningMessage] = []
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fitter.fit(data, **fit_kwargs)
+    finally:
+        messages: List[str] = []
+        for w in caught:
+            if issubclass(w.category, ConvergenceWarning):
+                messages.append(str(w.message).strip())
+            else:
+                warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
+    return messages
 
 
 class PenalizedCox:
@@ -50,6 +76,7 @@ class PenalizedCox:
         self._dropped_columns: List[str] = []
         self._converged: bool = False
         self._error_message: Optional[str] = None
+        self._convergence_warnings: List[str] = []
 
     # ------------------------------------------------------------------
     # Fitting
@@ -136,14 +163,20 @@ class PenalizedCox:
         self._training_data = data.copy()
         self._fitter = CoxPHFitter(penalizer=pen, l1_ratio=self.l1_ratio)
         try:
-            self._fitter.fit(
+            self._convergence_warnings = fit_recording_convergence(
+                self._fitter,
                 data,
                 duration_col=duration_col,
                 event_col=event_col,
                 show_progress=False,
             )
-            self._converged = True
-            self._error_message = None
+            # A lifelines ConvergenceWarning means the estimates may be
+            # unreliable even though no exception was raised.
+            self._converged = not self._convergence_warnings
+            self._error_message = (
+                "; ".join(self._convergence_warnings)
+                if self._convergence_warnings else None
+            )
         except Exception as exc:
             self._converged = False
             self._error_message = str(exc)
@@ -177,6 +210,11 @@ class PenalizedCox:
     def converged(self) -> bool:
         """Whether the most recent fit converged successfully."""
         return self._converged
+
+    @property
+    def convergence_warnings(self) -> List[str]:
+        """Lifelines ``ConvergenceWarning`` messages raised during the last fit."""
+        return list(self._convergence_warnings)
 
     @property
     def dropped_columns(self) -> List[str]:
@@ -224,7 +262,7 @@ class PenalizedCox:
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def check_proportional_hazards(self) -> Dict[str, float]:
+    def check_proportional_hazards(self) -> Dict[str, Any]:
         """Test the proportional hazards assumption for every covariate.
 
         Uses the Schoenfeld residual test via
@@ -235,6 +273,9 @@ class PenalizedCox:
         dict
             Mapping of covariate name to p-value from the PH test.
             A small p-value suggests violation of the PH assumption.
+            If the test itself fails, returns ``{"__error__": <message>}``
+            (an explicit marker, so a failure is never mistaken for
+            "no violations").
         """
         self._check_fitted()
         try:
@@ -250,8 +291,8 @@ class PenalizedCox:
             return dict(
                 zip(summary_df.index.get_level_values(0), summary_df["p"])
             )
-        except Exception:
-            return {}
+        except Exception as exc:
+            return {"__error__": f"PH test failed: {type(exc).__name__}: {exc}"}
 
     # ------------------------------------------------------------------
     # Internal helpers

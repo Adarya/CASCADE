@@ -9,7 +9,7 @@ encountered during multi-study analysis of clinical genomics data.
 Main exports:
     PitfallDetector  - Orchestrator that runs all applicable checks.
     PitfallWarning   - Warning object emitted when a pitfall is detected.
-    PITFALL_LIBRARY  - List of all 9 canonical pitfall definitions.
+    PITFALL_LIBRARY  - List of all 11 canonical pitfall definitions.
     PitfallRegistry  - Extensible registry for managing pitfalls.
 
 Quick start:

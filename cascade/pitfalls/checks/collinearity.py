@@ -10,6 +10,7 @@ deterministic function of others.
 Pitfall #3 in the CASCADE library.
 """
 
+import warnings as _pywarnings
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -60,6 +61,20 @@ def check_collinearity(
     # Ensure numeric
     X_numeric = X.select_dtypes(include=[np.number])
     if X_numeric.shape[1] < 2:
+        return warnings
+
+    # Drop incomplete rows (VIF / SVD cannot handle NaN or inf)
+    X_numeric = X_numeric.replace([np.inf, -np.inf], np.nan)
+    n_incomplete = int(X_numeric.isna().any(axis=1).sum())
+    if n_incomplete:
+        _pywarnings.warn(
+            f"check_collinearity: dropped {n_incomplete} of {len(X_numeric)} "
+            f"rows with missing values before VIF / rank checks.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        X_numeric = X_numeric.dropna()
+    if len(X_numeric) < 3:
         return warnings
 
     # Drop columns with zero variance (handled by constant_variable check)
@@ -216,7 +231,9 @@ def _check_algebraic_identity(
     X_arr = X.values.astype(float)
     n_features = X_arr.shape[1]
 
-    # Check rank
+    # Check rank on the centred, unit-scaled matrix (implicit intercept,
+    # scale-invariant tolerance)
+    X_arr = (X_arr - X_arr.mean(axis=0)) / X_arr.std(axis=0)
     rank = np.linalg.matrix_rank(X_arr)
 
     if rank < n_features:

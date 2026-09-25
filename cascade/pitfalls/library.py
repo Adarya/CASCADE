@@ -95,7 +95,7 @@ class PitfallWarning:
 
 
 # ---------------------------------------------------------------------------
-# The canonical library of 9 known pitfalls
+# The canonical library of 11 known pitfalls
 # ---------------------------------------------------------------------------
 
 PITFALL_LIBRARY: List[Pitfall] = [

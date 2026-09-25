@@ -2,9 +2,10 @@
 Check: Comment Header Corruption
 =================================
 
-Detects whether a tab-delimited data file contains columns with hex
-color codes (e.g., STYLE_COLOR = '#359645') that would be corrupted
-if parsed with ``comment='#'`` in pandas.
+Detects whether a tab-delimited data file contains data rows with the
+comment character anywhere in a field -- most commonly hex color codes
+(e.g., STYLE_COLOR = '#359645'), but also free text such as 'Tumor #2'
+-- that would be truncated if parsed with ``comment='#'`` in pandas.
 
 Pitfall #1 in the CASCADE library.
 """
@@ -28,9 +29,11 @@ def check_comment_corruption(
 ) -> List[PitfallWarning]:
     """Check whether a file has columns that would be corrupted by comment parsing.
 
-    Reads up to ``max_lines`` non-comment data rows and checks for hex
-    color patterns. If found, emitting ``comment='#'`` in pandas will
-    silently truncate those rows.
+    Reads up to ``max_lines`` non-comment data rows and flags every
+    column containing ``comment_char`` (hex colours or any other text).
+    Using ``comment='#'`` in pandas silently truncates such rows from
+    that character onward.  Lines are split on tabs without stripping,
+    so an empty leading field does not shift column indices.
 
     Parameters
     ----------
@@ -44,7 +47,7 @@ def check_comment_corruption(
     Returns
     -------
     list of PitfallWarning
-        One warning per column found to contain hex color values.
+        One warning per column found to contain the comment character.
         Empty list if the file is safe to parse with ``comment='#'``.
     """
     filepath = Path(filepath)
@@ -69,20 +72,22 @@ def check_comment_corruption(
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                stripped = line.strip()
-                if not stripped:
+                # Remove only the line terminator; keep leading / trailing
+                # tabs so empty fields keep their column position.
+                raw = line.rstrip("\r\n")
+                if not raw.strip():
                     continue
 
                 # Lines starting with comment_char are metadata
-                if stripped.startswith(comment_char):
+                if raw.lstrip(" ").startswith(comment_char):
                     continue
 
                 # First non-comment line is the header
                 if header_row is None:
-                    header_row = stripped
+                    header_row = raw
                     continue
 
-                data_lines.append(stripped)
+                data_lines.append(raw)
                 if len(data_lines) >= max_lines:
                     break
     except (IOError, OSError) as exc:
@@ -102,29 +107,33 @@ def check_comment_corruption(
 
     columns = header_row.split("\t")
 
-    # Track which columns contain hex color values
-    hex_columns: dict[int, str] = {}
+    # Track which columns contain the comment character (and whether it
+    # looks like a hex colour, for a more specific message)
+    hash_columns: dict[int, str] = {}
+    hex_like: dict[int, bool] = {}
 
     for line in data_lines:
         fields = line.split("\t")
         for idx, field_value in enumerate(fields):
-            if idx in hex_columns:
-                continue  # Already flagged
+            if comment_char not in field_value:
+                continue
+            if idx not in hash_columns:
+                hash_columns[idx] = columns[idx] if idx < len(columns) else f"column_{idx}"
             if _HEX_COLOR_RE.search(field_value):
-                col_name = columns[idx] if idx < len(columns) else f"column_{idx}"
-                hex_columns[idx] = col_name
+                hex_like[idx] = True
 
-    # Emit a warning for each hex-containing column
-    for idx, col_name in sorted(hex_columns.items()):
+    # Emit a warning for each affected column
+    for idx, col_name in sorted(hash_columns.items()):
         # Determine how many downstream columns would be affected
         downstream_count = len(columns) - idx - 1
+        what = "hex color values" if hex_like.get(idx) else f"'{comment_char}' characters"
 
         warnings.append(
             PitfallWarning(
                 pitfall=_PITFALL,
                 message=(
-                    f"Column '{col_name}' (index {idx}) contains hex color "
-                    f"values. Using comment='{comment_char}' will truncate "
+                    f"Column '{col_name}' (index {idx}) contains {what}. "
+                    f"Using comment='{comment_char}' will truncate "
                     f"this and {downstream_count} subsequent column(s) on "
                     f"affected rows."
                 ),

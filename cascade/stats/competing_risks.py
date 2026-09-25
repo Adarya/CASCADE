@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
 
+from cascade.stats.cox import fit_recording_convergence
+
 try:
     from lifelines import AalenJohansenFitter
 
@@ -47,6 +49,7 @@ class CauseSpecificCox:
         self._cause: Optional[Any] = None
         self._converged: bool = False
         self._error_message: Optional[str] = None
+        self._convergence_warnings: List[str] = []
 
     # ------------------------------------------------------------------
     # Fitting
@@ -82,7 +85,8 @@ class CauseSpecificCox:
         self
         """
         self._cause = cause_of_interest
-        data = df[[duration_col, event_col] + list(covariates)].copy()
+        covariates = list(dict.fromkeys(covariates))  # de-duplicate
+        data = df[[duration_col, event_col] + covariates].copy()
         data = data.dropna()
 
         if len(data) == 0:
@@ -115,14 +119,18 @@ class CauseSpecificCox:
 
         self._fitter = CoxPHFitter(penalizer=self.penalizer)
         try:
-            self._fitter.fit(
+            self._convergence_warnings = fit_recording_convergence(
+                self._fitter,
                 data,
                 duration_col=duration_col,
                 event_col=cs_event_col,
                 show_progress=False,
             )
-            self._converged = True
-            self._error_message = None
+            self._converged = not self._convergence_warnings
+            self._error_message = (
+                "; ".join(self._convergence_warnings)
+                if self._convergence_warnings else None
+            )
         except Exception as exc:
             self._converged = False
             self._error_message = str(exc)
@@ -150,8 +158,13 @@ class CauseSpecificCox:
 
     @property
     def converged(self) -> bool:
-        """Whether the model converged."""
+        """Whether the model converged (no exception and no ConvergenceWarning)."""
         return self._converged
+
+    @property
+    def convergence_warnings(self) -> List[str]:
+        """Lifelines ``ConvergenceWarning`` messages raised during the fit."""
+        return list(self._convergence_warnings)
 
     # ------------------------------------------------------------------
     # Cumulative incidence
@@ -162,6 +175,7 @@ class CauseSpecificCox:
         durations: pd.Series,
         event_observed: pd.Series,
         times: Optional[np.ndarray] = None,
+        seed: int = 42,
     ) -> pd.DataFrame:
         """Estimate cumulative incidence function via Aalen-Johansen.
 
@@ -177,6 +191,9 @@ class CauseSpecificCox:
         times : array-like, optional
             Time points at which to evaluate the CIF.  If ``None``,
             all unique event times are used.
+        seed : int, default 42
+            Seed for the small random jitter lifelines applies to tied
+            event times; fixed so the CIF is reproducible.
 
         Returns
         -------
@@ -193,7 +210,7 @@ class CauseSpecificCox:
         if self._cause is None:
             raise RuntimeError("Model not fitted; cause of interest unknown.")
 
-        aj = AalenJohansenFitter(calculate_variance=False)
+        aj = AalenJohansenFitter(calculate_variance=False, seed=seed)
         aj.fit(durations, event_observed=event_observed, event_of_interest=self._cause)
 
         cif = aj.cumulative_density_
@@ -247,16 +264,29 @@ def cause_specific_screen(
     min_exposed : int, default 10
         Minimum patients with gene_col == 1 to attempt the model.
     min_events : int, default 5
-        Minimum events of the cause of interest to attempt the model.
+        Minimum events of the cause of interest required **in each
+        exposure arm** (``gene_col == 1`` and ``gene_col == 0``) to
+        attempt the model.  Arms with fewer events give a quasi-separated
+        fit (e.g. HR -> 0 with a spuriously small p-value).
 
     Returns
     -------
     DataFrame
         One row per site with columns: gene, site, n, n_events,
-        n_exposed, coef, hr, se, z, p, ci_lower, ci_upper, converged.
+        n_exposed, n_events_exposed, n_events_unexposed, coef, hr, se, z,
+        p, ci_lower, ci_upper, converged, skip_reason.  ``converged`` is
+        ``False`` when the model was skipped, failed, or raised a lifelines
+        ``ConvergenceWarning`` (``skip_reason`` then gives the reason;
+        estimates are still reported for ConvergenceWarning fits).
     """
     results: List[Dict[str, Any]] = []
-    all_covs = [gene_col] + [c for c in covariates if c != gene_col]
+    other_covs = [c for c in dict.fromkeys(covariates) if c != gene_col]
+    all_covs = [gene_col] + other_covs
+    nan_stats = dict(
+        coef=np.nan, hr=np.nan, se=np.nan, z=np.nan,
+        p=np.nan, ci_lower=np.nan, ci_upper=np.nan,
+        converged=False,
+    )
 
     for site in site_cols:
         row: Dict[str, Any] = {
@@ -264,19 +294,30 @@ def cause_specific_screen(
             "site": site,
         }
 
-        sub = df[[duration_col, site, gene_col] + list(covariates)].dropna()
+        sub_cols = list(dict.fromkeys([duration_col, site] + all_covs))
+        sub = df[sub_cols].dropna()
         n_events = int(sub[site].sum())
         n_exposed = int(sub[gene_col].sum())
+        exposed = sub[gene_col] == 1
+        n_ev_exp = int(sub.loc[exposed, site].sum())
+        n_ev_unexp = int(sub.loc[~exposed, site].sum())
         row["n"] = len(sub)
         row["n_events"] = n_events
         row["n_exposed"] = n_exposed
+        row["n_events_exposed"] = n_ev_exp
+        row["n_events_unexposed"] = n_ev_unexp
+        row["skip_reason"] = ""
 
-        if n_exposed < min_exposed or n_events < min_events:
-            row.update(
-                coef=np.nan, hr=np.nan, se=np.nan, z=np.nan,
-                p=np.nan, ci_lower=np.nan, ci_upper=np.nan,
-                converged=False,
+        reason = ""
+        if n_exposed < min_exposed:
+            reason = f"n_exposed={n_exposed} < min_exposed={min_exposed}"
+        elif min(n_ev_exp, n_ev_unexp) < min_events:
+            reason = (
+                f"events per arm (exposed={n_ev_exp}, unexposed={n_ev_unexp}) "
+                f"< min_events={min_events}"
             )
+        if reason:
+            row.update(nan_stats, skip_reason=reason)
             results.append(row)
             continue
 
@@ -288,18 +329,15 @@ def cause_specific_screen(
         # Drop constant covariates
         fit_covs = [c for c in all_covs if sub[c].nunique() > 1]
         if gene_col not in fit_covs:
-            row.update(
-                coef=np.nan, hr=np.nan, se=np.nan, z=np.nan,
-                p=np.nan, ci_lower=np.nan, ci_upper=np.nan,
-                converged=False,
-            )
+            row.update(nan_stats, skip_reason=f"{gene_col} is constant")
             results.append(row)
             continue
 
         fit_data = sub[[duration_col, cs_event] + fit_covs]
         fitter = CoxPHFitter(penalizer=penalizer)
         try:
-            fitter.fit(
+            conv_warnings = fit_recording_convergence(
+                fitter,
                 fit_data,
                 duration_col=duration_col,
                 event_col=cs_event,
@@ -314,14 +352,12 @@ def cause_specific_screen(
                 p=s["p"],
                 ci_lower=s["exp(coef) lower 95%"],
                 ci_upper=s["exp(coef) upper 95%"],
-                converged=True,
+                converged=not conv_warnings,
             )
+            if conv_warnings:
+                row["skip_reason"] = "ConvergenceWarning: " + "; ".join(conv_warnings)
         except Exception as exc:
-            row.update(
-                coef=np.nan, hr=np.nan, se=np.nan, z=np.nan,
-                p=np.nan, ci_lower=np.nan, ci_upper=np.nan,
-                converged=False,
-            )
+            row.update(nan_stats, skip_reason=f"fit failed: {exc}")
 
         results.append(row)
 

@@ -9,7 +9,8 @@ which constitutes future-data leakage.
 Pitfall #2 in the CASCADE library.
 """
 
-from typing import List, Optional
+import re
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -18,24 +19,43 @@ from ..library import PitfallWarning, Severity, PITFALL_LIBRARY
 
 _PITFALL = PITFALL_LIBRARY[1]  # id=2, covariate leakage
 
+# Name fragments typical of covariates aggregated over the whole
+# follow-up ("ever received X", "any X", counts / totals).
+_LEAKY_NAME_RE = re.compile(
+    r"(^|_)(EVER|ANY|TOTAL|CUMULATIVE|CUM|COUNT)(_|$)",
+    re.IGNORECASE,
+)
+
 
 def check_landmark_leakage(
     df: pd.DataFrame,
     landmark_date_col: str,
     covariate_cols: List[str],
-    event_date_cols: Optional[List[str]] = None,
+    event_date_cols: Optional[Union[List[str], Dict[str, str]]] = None,
+    followup_col: Optional[str] = None,
+    corr_threshold: float = 0.2,
 ) -> List[PitfallWarning]:
     """Check for future-data leakage in landmark model covariates.
 
     This check addresses two scenarios:
 
-    1. **With event dates** (``event_date_cols`` provided): For each
-       covariate, verifies that no contributing event occurs after the
-       landmark date.
-    2. **Without event dates** (heuristic mode): Checks if binary
-       "ever received" covariates are constant across different landmark
-       dates for the same patient, which suggests they were computed
-       over the full follow-up rather than up to the landmark.
+    1. **Date mode** (``event_date_cols`` provided): each covariate is
+       compared only against **its own** exposure-date column.  Pass a
+       mapping ``{covariate: exposure_date_col}``; if a plain list is
+       given, a covariate is paired with a date column only when one
+       name contains the other (e.g. ``EVER_ICI`` / ``EVER_ICI_DATE``).
+       A covariate is flagged (CRITICAL) when it is nonzero in rows
+       whose exposure date is after the landmark / anchor date.
+       Covariates with no mapped date column are not tested (an INFO
+       warning lists them) -- e.g. ``AGE`` is never compared with an
+       unrelated event date.
+    2. **Heuristic mode** (no dates): a covariate is flagged when its
+       name matches an "ever / any / total / count" pattern (WARNING),
+       and additionally -- if ``followup_col`` is given -- when it is
+       positively correlated with follow-up time above
+       ``corr_threshold`` (longer follow-up => more opportunity to become
+       "ever exposed"); both together are CRITICAL.  The landmark date
+       itself is not used, so a constant landmark is handled.
 
     Parameters
     ----------
@@ -43,13 +63,18 @@ def check_landmark_leakage(
         The analysis dataframe. Must contain at least the landmark date
         column and the covariate columns.
     landmark_date_col : str
-        Column name containing the landmark date (numeric, in days).
+        Column name containing the landmark / anchor date (numeric, in
+        days).  May be constant.
     covariate_cols : list of str
         Column names of covariates to check for leakage.
-    event_date_cols : list of str, optional
-        Column names containing dates of events that contribute to the
-        covariates. If provided, direct date-based leakage detection is
-        performed. If None, heuristic checks are used.
+    event_date_cols : dict or list of str, optional
+        Exposure-date columns (see date mode).  If None, heuristic checks
+        are used.
+    followup_col : str, optional
+        Follow-up time column used by the heuristic correlation test.
+    corr_threshold : float
+        Minimum positive correlation with follow-up time to flag in
+        heuristic mode (default 0.2).
 
     Returns
     -------
@@ -59,7 +84,10 @@ def check_landmark_leakage(
     warnings: List[PitfallWarning] = []
 
     # Validate inputs
-    missing_cols = [c for c in [landmark_date_col] + covariate_cols if c not in df.columns]
+    needed = [landmark_date_col] + covariate_cols
+    if followup_col is not None:
+        needed.append(followup_col)
+    missing_cols = [c for c in needed if c not in df.columns]
     if missing_cols:
         warnings.append(
             PitfallWarning(
@@ -72,108 +100,131 @@ def check_landmark_leakage(
         )
         return warnings
 
-    landmark_dates = df[landmark_date_col]
+    landmark_numeric = pd.to_numeric(df[landmark_date_col], errors="coerce")
 
-    # --- Strategy 1: Direct date-based check ---
+    # --- Strategy 1: Direct date-based check (covariate -> own date) ---
     if event_date_cols is not None:
-        valid_event_cols = [c for c in event_date_cols if c in df.columns]
-        for event_col in valid_event_cols:
-            # Find rows where event date is after the landmark date
-            # and the associated covariate is nonzero
-            event_dates = pd.to_numeric(df[event_col], errors="coerce")
-            landmark_numeric = pd.to_numeric(landmark_dates, errors="coerce")
+        mapping = _resolve_date_mapping(covariate_cols, event_date_cols, df)
+        unmapped = [c for c in covariate_cols if c not in mapping]
+        for cov_col, date_col in mapping.items():
+            event_dates = pd.to_numeric(df[date_col], errors="coerce")
+            cov_values = pd.to_numeric(df[cov_col], errors="coerce")
+            leaking_rows = (event_dates > landmark_numeric) & (cov_values != 0) & cov_values.notna()
+            n_leaking = int(leaking_rows.sum())
 
-            post_landmark_mask = event_dates > landmark_numeric
-            post_landmark_count = post_landmark_mask.sum()
-
-            if post_landmark_count > 0:
-                # Check which covariates are nonzero for these rows
-                for cov_col in covariate_cols:
-                    cov_values = pd.to_numeric(df[cov_col], errors="coerce")
-                    leaking_rows = post_landmark_mask & (cov_values != 0)
-                    n_leaking = leaking_rows.sum()
-
-                    if n_leaking > 0:
-                        pct = 100.0 * n_leaking / len(df)
-                        warnings.append(
-                            PitfallWarning(
-                                pitfall=_PITFALL,
-                                message=(
-                                    f"Covariate '{cov_col}' has nonzero values in "
-                                    f"{n_leaking} rows ({pct:.1f}%) where event date "
-                                    f"'{event_col}' is after the landmark date "
-                                    f"'{landmark_date_col}'. This indicates future "
-                                    f"data leakage."
-                                ),
-                                location=cov_col,
-                                severity=Severity.CRITICAL,
-                                suggestion=(
-                                    f"Recompute '{cov_col}' using only events with "
-                                    f"'{event_col}' <= '{landmark_date_col}'. Filter "
-                                    f"the source timeline to dates on or before the "
-                                    f"landmark before aggregating."
-                                ),
-                            )
-                        )
+            if n_leaking > 0:
+                pct = 100.0 * n_leaking / len(df)
+                warnings.append(
+                    PitfallWarning(
+                        pitfall=_PITFALL,
+                        message=(
+                            f"Covariate '{cov_col}' has nonzero values in "
+                            f"{n_leaking} rows ({pct:.1f}%) where its exposure "
+                            f"date '{date_col}' is after the landmark date "
+                            f"'{landmark_date_col}'. This indicates future "
+                            f"data leakage."
+                        ),
+                        location=cov_col,
+                        severity=Severity.CRITICAL,
+                        suggestion=(
+                            f"Recompute '{cov_col}' using only events with "
+                            f"'{date_col}' <= '{landmark_date_col}'. Filter "
+                            f"the source timeline to dates on or before the "
+                            f"landmark before aggregating."
+                        ),
+                    )
+                )
+        if unmapped:
+            warnings.append(
+                PitfallWarning(
+                    pitfall=_PITFALL,
+                    message=(
+                        f"No exposure-date column mapped for covariate(s) "
+                        f"{unmapped}; they were not checked in date mode."
+                    ),
+                    location=", ".join(unmapped),
+                    severity=Severity.INFO,
+                    suggestion=(
+                        "Pass event_date_cols as {covariate: exposure_date_col} "
+                        "for time-dependent covariates."
+                    ),
+                )
+            )
         return warnings
 
     # --- Strategy 2: Heuristic check for "ever received" variables ---
+    followup = (
+        pd.to_numeric(df[followup_col], errors="coerce")
+        if followup_col is not None else None
+    )
     for cov_col in covariate_cols:
-        cov_values = df[cov_col]
+        cov_numeric = pd.to_numeric(df[cov_col], errors="coerce")
+        name_hit = bool(_LEAKY_NAME_RE.search(str(cov_col)))
 
-        # Skip non-binary columns for heuristic check
-        unique_vals = cov_values.dropna().unique()
-        if not set(unique_vals).issubset({0, 1, 0.0, 1.0, True, False}):
+        corr = np.nan
+        if followup is not None:
+            valid = cov_numeric.notna() & followup.notna()
+            if (
+                valid.sum() > 10
+                and cov_numeric[valid].nunique() > 1
+                and followup[valid].nunique() > 1
+            ):
+                corr = float(cov_numeric[valid].corr(followup[valid]))
+        corr_hit = bool(np.isfinite(corr) and corr >= corr_threshold)
+
+        if not (name_hit or corr_hit):
             continue
 
-        # Heuristic: if a binary "ever received" variable is 1 for
-        # patients whose landmark date is very early (e.g., bottom 10%),
-        # it may be leaking future treatments.
-        cov_numeric = pd.to_numeric(cov_values, errors="coerce")
-        landmark_numeric = pd.to_numeric(landmark_dates, errors="coerce")
-
-        positive_mask = cov_numeric == 1
-        if positive_mask.sum() == 0:
-            continue
-
-        # Compare median landmark date for positive vs negative cases
-        median_landmark_positive = landmark_numeric[positive_mask].median()
-        median_landmark_negative = landmark_numeric[~positive_mask].median()
-
-        # If positive cases have earlier landmarks on average, the
-        # variable may span the entire follow-up
-        if pd.notna(median_landmark_positive) and pd.notna(median_landmark_negative):
-            # Suspicious if the rate of positivity doesn't vary with
-            # landmark date. Check correlation between landmark date
-            # and covariate.
-            valid_mask = cov_numeric.notna() & landmark_numeric.notna()
-            if valid_mask.sum() > 10:
-                corr = cov_numeric[valid_mask].corr(landmark_numeric[valid_mask])
-                # If correlation is near zero, covariate doesn't depend
-                # on landmark date at all -- suspicious for a time-dependent
-                # variable
-                if pd.notna(corr) and abs(corr) < 0.05:
-                    warnings.append(
-                        PitfallWarning(
-                            pitfall=_PITFALL,
-                            message=(
-                                f"Binary covariate '{cov_col}' shows near-zero "
-                                f"correlation (r={corr:.3f}) with landmark date "
-                                f"'{landmark_date_col}'. For a legitimately "
-                                f"time-restricted variable, we would expect the "
-                                f"positive rate to increase with later landmarks. "
-                                f"This pattern is consistent with an 'ever received' "
-                                f"variable computed over the full follow-up."
-                            ),
-                            location=cov_col,
-                            severity=Severity.WARNING,
-                            suggestion=(
-                                f"Verify that '{cov_col}' was computed using only "
-                                f"events up to the landmark date. If it represents "
-                                f"'ever received treatment X', recompute from the "
-                                f"treatment timeline filtered to dates <= landmark."
-                            ),
-                        )
-                    )
+        reasons = []
+        if name_hit:
+            reasons.append(
+                "its name suggests an 'ever / any / total' aggregate over "
+                "the full follow-up"
+            )
+        if corr_hit:
+            reasons.append(
+                f"it is positively correlated with follow-up time "
+                f"'{followup_col}' (r={corr:.3f} >= {corr_threshold})"
+            )
+        warnings.append(
+            PitfallWarning(
+                pitfall=_PITFALL,
+                message=(
+                    f"Covariate '{cov_col}' may leak post-landmark "
+                    f"information: " + " and ".join(reasons) + "."
+                ),
+                location=cov_col,
+                severity=Severity.CRITICAL if (name_hit and corr_hit) else Severity.WARNING,
+                suggestion=(
+                    f"Verify that '{cov_col}' was computed using only "
+                    f"events up to the landmark date. If it represents "
+                    f"'ever received treatment X', recompute from the "
+                    f"treatment timeline filtered to dates <= landmark."
+                ),
+            )
+        )
 
     return warnings
+
+
+def _resolve_date_mapping(
+    covariate_cols: List[str],
+    event_date_cols: Union[List[str], Dict[str, str]],
+    df: pd.DataFrame,
+) -> Dict[str, str]:
+    """Map each covariate to its own exposure-date column."""
+    if isinstance(event_date_cols, dict):
+        return {
+            c: d for c, d in event_date_cols.items()
+            if c in covariate_cols and d in df.columns
+        }
+    mapping: Dict[str, str] = {}
+    date_cols = [d for d in event_date_cols if d in df.columns]
+    for cov in covariate_cols:
+        matches = [
+            d for d in date_cols
+            if cov.lower() in d.lower() or d.lower() in cov.lower()
+        ]
+        if len(matches) == 1:
+            mapping[cov] = matches[0]
+    return mapping

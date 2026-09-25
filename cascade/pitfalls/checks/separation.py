@@ -10,6 +10,7 @@ in one or more cells of the contingency table.
 Pitfall related to Study A v3 (4 separation-problem estimates filtered).
 """
 
+from dataclasses import replace
 from typing import List, Optional
 
 import numpy as np
@@ -17,13 +18,20 @@ import pandas as pd
 
 from ..library import PitfallWarning, Severity, PITFALL_LIBRARY
 
-# Use pitfall #3 (collinearity) as a close proxy; separation is related
-# but distinct. We'll reference the correct pitfall in the warning.
-# Since separation isn't one of the 9 canonical pitfalls, we create
-# warnings referencing the most relevant one or using a generic approach.
-# For this module, we reference pitfall #7 (singular matrix) since
-# separation causes similar numerical issues.
-_PITFALL = PITFALL_LIBRARY[6]  # id=7, singular matrix
+# Separation is not one of the 11 canonical pitfalls; it is filed under
+# pitfall #7 (numerical instability of the fit) but carries its own
+# name so reports do not mislabel it as "singular matrix from constant
+# covariate".
+_PITFALL = replace(
+    PITFALL_LIBRARY[6],  # id=7, numerical-instability family
+    name="Separation / extreme confidence interval (sparse cells)",
+    description=(
+        "Quasi-complete or complete separation: an estimate whose "
+        "confidence interval spans orders of magnitude on the hazard- or "
+        "odds-ratio scale because one or more cells contain (almost) no "
+        "events.  Related to, but distinct from, a singular design matrix."
+    ),
+)
 
 
 def check_separation_problems(
@@ -32,13 +40,17 @@ def check_separation_problems(
     ci_upper_col: str = "ci_upper",
     threshold: float = 100.0,
     estimate_col: Optional[str] = None,
+    log_scale: Optional[bool] = None,
 ) -> List[PitfallWarning]:
     """Check for separation problems by examining confidence interval ratios.
 
-    Computes CI_ratio = upper / lower for each row. When both bounds
-    are positive (as with hazard ratios or odds ratios on the same
-    side of 1), a very large ratio indicates quasi-separation or
-    sparse data.
+    The CI ratio is always computed on the **ratio (HR / OR) scale**:
+    ``upper / lower`` for ratio-scale bounds, or ``exp(upper - lower)``
+    for log-scale (coefficient) bounds.  This is a width criterion --
+    the ratio equals ``exp(width of the log-scale CI)`` -- so a narrow
+    CI close to zero on the log scale (e.g. [-2.0, -0.01], HR CI
+    [0.14, 0.99], ratio 7.3) is not flagged, while a CI spanning
+    orders of magnitude is.
 
     Parameters
     ----------
@@ -54,6 +66,9 @@ def check_separation_problems(
     estimate_col : str, optional
         Column name for the point estimate. If provided, included in
         warning messages for context.
+    log_scale : bool, optional
+        Whether the bounds are log-scale coefficients.  ``None``
+        (default) infers log scale when any bound is negative.
 
     Returns
     -------
@@ -79,6 +94,8 @@ def check_separation_problems(
 
     lower = pd.to_numeric(results_df[ci_lower_col], errors="coerce")
     upper = pd.to_numeric(results_df[ci_upper_col], errors="coerce")
+    if log_scale is None:
+        log_scale = bool((lower < 0).any() or (upper < 0).any())
 
     for idx in results_df.index:
         lo = lower.get(idx)
@@ -87,21 +104,15 @@ def check_separation_problems(
         if pd.isna(lo) or pd.isna(hi):
             continue
 
-        # Compute CI ratio
-        if lo > 0 and hi > 0:
+        # Compute CI ratio on the HR / OR scale
+        if log_scale:
+            with np.errstate(over="ignore"):
+                ratio = float(np.exp(abs(hi - lo)))
+        elif lo > 0 and hi > 0:
             ratio = hi / lo
-        elif lo < 0 and hi < 0:
-            ratio = abs(lo) / abs(hi)
-        elif lo == 0 or hi == 0:
-            # One bound at zero -- likely degenerate
-            ratio = float("inf")
         else:
-            # CI spans zero (includes null for log-scale estimates)
-            # Compute width as a proxy
-            width = hi - lo
-            # For HR/OR on log scale, this is less informative.
-            # Flag if the absolute range is extreme.
-            ratio = abs(hi - lo) if abs(hi - lo) > threshold else 0.0
+            # Ratio-scale lower bound at 0 (e.g. exp(-inf)) -- degenerate
+            ratio = float("inf")
 
         if ratio > threshold:
             # Build informative message

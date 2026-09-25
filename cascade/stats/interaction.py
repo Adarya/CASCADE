@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from itertools import combinations
+from itertools import combinations, product
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
+
+from cascade.stats.cox import fit_recording_convergence
 
 
 # ======================================================================
@@ -40,7 +42,10 @@ class InteractionResult:
     phenotype : str
         Name of the phenotype factor column (empty string for two-way).
     converged : bool
-        Whether the model converged.
+        Whether the model was fitted without error, without a lifelines
+        ``ConvergenceWarning``, and with every requested interaction term
+        estimable.  ``False`` for designs with an empty / undersized
+        subgroup cell or an aliased / dropped interaction term.
     n_patients : int
         Number of patients in the analysis.
     n_events : int
@@ -257,16 +262,37 @@ class InteractionCox:
         bool
             ``True`` if all cells meet the minimums.
         """
+        return not self._subgroup_failures(df, factors, event_col, min_n, min_events)
+
+    def _subgroup_failures(
+        self,
+        df: pd.DataFrame,
+        factors: List[str],
+        event_col: str,
+        min_n: Optional[int] = None,
+        min_events: Optional[int] = None,
+    ) -> List[str]:
+        """Describe every design cell that fails the size minimums.
+
+        All ``2**k`` cells of the binary design are enumerated, including
+        cells with **zero** patients (``groupby`` alone would skip them,
+        letting an empty cell alias interaction terms).
+        """
         min_n = min_n if min_n is not None else self.min_subgroup_n
         min_events = min_events if min_events is not None else self.min_subgroup_events
 
-        grouped = df.groupby(factors)
-        for _, group in grouped:
-            if len(group) < min_n:
-                return False
-            if group[event_col].sum() < min_events:
-                return False
-        return True
+        levels = [sorted(set(df[f].dropna().unique()) | {0, 1}) for f in factors]
+        counts = df.groupby(factors).size()
+        events = df.groupby(factors)[event_col].sum()
+        failures: List[str] = []
+        for cell in product(*levels):
+            key = cell if len(factors) > 1 else cell[0]
+            n = int(counts.get(key, 0))
+            e = float(events.get(key, 0))
+            if n < min_n or e < min_events:
+                label = ", ".join(f"{f}={v}" for f, v in zip(factors, cell))
+                failures.append(f"[{label}] n={n}, events={e:g}")
+        return failures
 
     # ------------------------------------------------------------------
     # Internal fitting
@@ -298,11 +324,14 @@ class InteractionCox:
             result.error_message = "No rows after dropping NaN."
             return result
 
-        # Check subgroup sizes
-        if not self._check_subgroup_sizes(data, factors, event_col):
+        # Check subgroup sizes (all 2^k cells, including empty ones)
+        failures = self._subgroup_failures(data, factors, event_col)
+        if failures:
             result.error_message = (
-                f"Insufficient subgroup sizes (min_n={self.min_subgroup_n}, "
-                f"min_events={self.min_subgroup_events})."
+                f"Not evaluable: insufficient subgroup sizes "
+                f"(min_n={self.min_subgroup_n}, "
+                f"min_events={self.min_subgroup_events}); failing cells: "
+                + "; ".join(failures)
             )
             return result
 
@@ -333,12 +362,31 @@ class InteractionCox:
             result.error_message = "All model columns are constant."
             return result
 
+        # Never report a fit whose interaction terms were dropped or are
+        # aliased with each other (e.g. g:t == g:t:p when a cell is empty).
+        design_terms = factors + all_int_names
+        dropped_terms = [c for c in design_terms if c in dropped]
+        if dropped_terms:
+            result.error_message = (
+                f"Not evaluable: design term(s) {dropped_terms} are constant."
+            )
+            return result
+        design = data[design_terms].to_numpy(dtype=float)
+        design = np.column_stack([np.ones(len(design)), design])
+        if np.linalg.matrix_rank(design) < design.shape[1]:
+            result.error_message = (
+                "Not evaluable: interaction design is rank-deficient "
+                "(aliased interaction terms)."
+            )
+            return result
+
         fit_data = data[[duration_col, event_col] + final_covs]
 
         # Fit
         fitter = CoxPHFitter(penalizer=self.penalizer)
         try:
-            fitter.fit(
+            conv_warnings = fit_recording_convergence(
+                fitter,
                 fit_data,
                 duration_col=duration_col,
                 event_col=event_col,
@@ -348,7 +396,9 @@ class InteractionCox:
             result.error_message = str(exc)
             return result
 
-        result.converged = True
+        result.converged = not conv_warnings
+        if conv_warnings:
+            result.error_message = "ConvergenceWarning: " + "; ".join(conv_warnings)
         result.concordance = fitter.concordance_index_
         result.log_likelihood = fitter.log_likelihood_
         result.aic = fitter.AIC_partial_
@@ -368,6 +418,11 @@ class InteractionCox:
         # Extract three-way effect
         if three_way_name is not None and three_way_name in summary.index:
             result.three_way_effect = _extract_effect(summary, three_way_name)
+        elif three_way_name is not None:
+            result.converged = False
+            result.error_message = (
+                f"Three-way term '{three_way_name}' missing from the fitted model."
+            )
 
         return result
 
@@ -440,13 +495,17 @@ def stratified_effect(
     fit_data = data[[duration_col, event_col] + model_cols]
     fitter = CoxPHFitter(penalizer=penalizer)
     try:
-        fitter.fit(fit_data, duration_col=duration_col, event_col=event_col,
-                    show_progress=False)
+        conv_warnings = fit_recording_convergence(
+            fitter, fit_data, duration_col=duration_col, event_col=event_col,
+            show_progress=False,
+        )
     except Exception as exc:
         out["error_message"] = str(exc)
         return out
 
-    out["converged"] = True
+    out["converged"] = not conv_warnings
+    if conv_warnings:
+        out["error_message"] = "ConvergenceWarning: " + "; ".join(conv_warnings)
     s = fitter.summary
 
     # Gene HR in untreated stratum = exp(beta_gene)

@@ -11,6 +11,7 @@ has a proportional number of events and censored observations.
 
 from __future__ import annotations
 
+import warnings
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -55,7 +56,9 @@ def cv_concordance(
     std_c : float
         Standard deviation of concordance across folds.
     fold_cs : list of float
-        Per-fold concordance values.
+        Per-fold concordance values.  Failed folds (fit/prediction error,
+        or every covariate constant in the training split) are NaN,
+        excluded from the mean, and counted in a ``RuntimeWarning``.
     """
     cov_list = list(covariates)
     all_cols = [duration_col, event_col] + cov_list
@@ -76,9 +79,13 @@ def cv_concordance(
         test = data.iloc[test_idx]
 
         # Drop constant covariates in the training set
+        if len(cov_list) == 0:
+            fold_cs.append(0.5)  # null model by design
+            continue
         fit_covs = [c for c in cov_list if train[c].nunique() > 1]
         if len(fit_covs) == 0:
-            fold_cs.append(0.5)
+            # No estimable covariate: not a genuine C = 0.5, a failed fold.
+            fold_cs.append(np.nan)
             continue
 
         fit_data = train[[duration_col, event_col] + fit_covs]
@@ -108,6 +115,7 @@ def cv_concordance(
             fold_cs.append(np.nan)
 
     valid = [c for c in fold_cs if not np.isnan(c)]
+    _warn_failed_folds(len(fold_cs) - len(valid), len(fold_cs), "cv_concordance")
     if len(valid) == 0:
         return np.nan, np.nan, fold_cs
 
@@ -152,7 +160,11 @@ def cv_delta_c(
     delta_c_std : float
         Standard deviation across folds.
     fold_deltas : list of float
-        Per-fold delta-C values.
+        Per-fold delta-C values.  Failed folds are NaN, excluded from the
+        mean, and counted in a ``RuntimeWarning``.  An empty *base_vars*
+        is a null model and is scored C = 0.5 by design; a non-empty
+        covariate set that is entirely constant in a training split is
+        treated as a failed fold.
     """
     base_list = list(base_vars)
     full_list = list(full_vars)
@@ -182,6 +194,7 @@ def cv_delta_c(
             fold_deltas.append(c_full - c_base)
 
     valid = [d for d in fold_deltas if not np.isnan(d)]
+    _warn_failed_folds(len(fold_deltas) - len(valid), len(fold_deltas), "cv_delta_c")
     if len(valid) == 0:
         return np.nan, np.nan, fold_deltas
 
@@ -203,10 +216,12 @@ def _fit_and_score(
     event_col: str,
     penalizer: float,
 ) -> float:
-    """Fit on train, evaluate C-index on test."""
+    """Fit on train, evaluate C-index on test (NaN on failure)."""
+    if len(covariates) == 0:
+        return 0.5  # null model by design: constant risk score
     fit_covs = [c for c in covariates if train[c].nunique() > 1]
     if len(fit_covs) == 0:
-        return 0.5
+        return np.nan  # all covariates constant in this split: failed fold
 
     fit_data = train[[duration_col, event_col] + fit_covs]
     fitter = CoxPHFitter(penalizer=penalizer)
@@ -231,3 +246,14 @@ def _fit_and_score(
         return float(c)
     except Exception:
         return np.nan
+
+
+def _warn_failed_folds(n_failed: int, n_total: int, where: str) -> None:
+    """Emit a RuntimeWarning reporting failed CV folds."""
+    if n_failed > 0:
+        warnings.warn(
+            f"{where}: {n_failed}/{n_total} folds failed (NaN) and were "
+            f"excluded from the mean.",
+            RuntimeWarning,
+            stacklevel=3,
+        )

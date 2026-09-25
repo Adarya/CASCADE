@@ -286,29 +286,84 @@ class DeltaC:
         Returns
         -------
         dict
-            Keys: ``delta_c``, ``ci`` (tuple of lower, upper),
-            ``p_value``, ``base_c``, ``full_c``.
+            Keys: ``delta_c`` (mean out-of-fold Delta-C over valid folds),
+            ``ci`` (tuple of lower, upper; bootstrap over folds),
+            ``p_value``, ``base_c``, ``full_c`` (cross-validated C of each
+            model), ``n_failed_folds``.
         """
-        # Try CASCADE stats first
-        if cv_delta_c is not None:
-            try:
-                return cv_delta_c(
-                    df=df,
-                    base_vars=list(base_vars),
-                    full_vars=list(full_vars),
-                    duration_col=duration_col,
-                    event_col=event_col,
-                    n_folds=self.n_folds,
-                    n_bootstrap=self.n_bootstrap,
-                    penalizer=self.penalizer,
-                    seed=self.seed,
-                )
-            except Exception:
-                pass
+        base_vars = list(base_vars)
+        full_vars = list(full_vars)
+
+        # Preferred route: CASCADE stats (stratified K-fold, out-of-sample C)
+        if cv_delta_c is not None and cv_concordance is not None:
+            all_cols = list(dict.fromkeys([duration_col, event_col] + base_vars + full_vars))
+            clean = df[all_cols].dropna().reset_index(drop=True)
+            if len(clean) < self.n_folds * 2:
+                return self._empty_result()
+            _, _, fold_deltas = cv_delta_c(
+                clean, base_vars, full_vars, duration_col, event_col,
+                n_folds=self.n_folds, penalizer=self.penalizer, seed=self.seed,
+            )
+            # Same data + seed => same folds as cv_delta_c
+            base_c, _, _ = cv_concordance(
+                clean, base_vars, duration_col, event_col,
+                n_folds=self.n_folds, penalizer=self.penalizer, seed=self.seed,
+            )
+            full_c, _, _ = cv_concordance(
+                clean, full_vars, duration_col, event_col,
+                n_folds=self.n_folds, penalizer=self.penalizer, seed=self.seed,
+            )
+            return self._summarise(fold_deltas, base_c, full_c)
 
         # Fallback: manual K-fold CV
         return self._compute_manual(
-            df, list(base_vars), list(full_vars), duration_col, event_col
+            df, base_vars, full_vars, duration_col, event_col
+        )
+
+    @staticmethod
+    def _empty_result() -> Dict[str, Any]:
+        return dict(
+            delta_c=np.nan, ci=(np.nan, np.nan),
+            p_value=np.nan, base_c=np.nan, full_c=np.nan, n_failed_folds=np.nan,
+        )
+
+    def _summarise(
+        self,
+        fold_deltas: Sequence[float],
+        base_c: float,
+        full_c: float,
+    ) -> Dict[str, Any]:
+        """Mean fold Delta-C with a bootstrap-over-folds CI and p-value.
+
+        Failed folds (NaN) are excluded and counted in ``n_failed_folds``.
+        """
+        rng = np.random.RandomState(self.seed)
+        arr = np.asarray(fold_deltas, dtype=float)
+        valid = arr[np.isfinite(arr)]
+        n_failed = int(len(arr) - len(valid))
+        if len(valid) == 0:
+            out = self._empty_result()
+            out["n_failed_folds"] = n_failed
+            return out
+
+        deltas = np.array([
+            rng.choice(valid, size=len(valid), replace=True).mean()
+            for _ in range(self.n_bootstrap)
+        ])
+        ci = (float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5)))
+
+        # Approximate p-value
+        p_value = float((deltas <= 0).sum() / len(deltas))
+        if p_value == 0:
+            p_value = 1.0 / (len(deltas) + 1)
+
+        return dict(
+            delta_c=float(valid.mean()),
+            ci=ci,
+            p_value=p_value,
+            base_c=float(base_c),
+            full_c=float(full_c),
+            n_failed_folds=n_failed,
         )
 
     def _compute_manual(
@@ -319,20 +374,18 @@ class DeltaC:
         duration_col: str,
         event_col: str,
     ) -> Dict[str, Any]:
-        """Manual cross-validated Delta-C computation."""
+        """Manual cross-validated Delta-C computation (used only when
+        ``cascade.stats.cross_validate`` cannot be imported)."""
         from lifelines import CoxPHFitter
         from lifelines.utils import concordance_index
         from sklearn.model_selection import KFold
 
         rng = np.random.RandomState(self.seed)
-        all_cols = list(set([duration_col, event_col] + full_vars))
+        all_cols = list(set([duration_col, event_col] + base_vars + full_vars))
         clean = df[all_cols].dropna()
 
         if len(clean) < self.n_folds * 2:
-            return dict(
-                delta_c=np.nan, ci=(np.nan, np.nan),
-                p_value=np.nan, base_c=np.nan, full_c=np.nan,
-            )
+            return self._empty_result()
 
         kf = KFold(n_splits=self.n_folds, shuffle=True, random_state=rng.randint(1e6))
 
@@ -344,10 +397,13 @@ class DeltaC:
             test = clean.iloc[test_idx]
 
             for var_set, c_list in [(base_vars, base_cs), (full_vars, full_cs)]:
-                # Drop constant cols
+                if not var_set:
+                    c_list.append(0.5)  # null model by design
+                    continue
+                # Drop constant cols; none left => failed fold
                 fit_vars = [v for v in var_set if train[v].nunique() > 1]
                 if not fit_vars:
-                    c_list.append(0.5)
+                    c_list.append(np.nan)
                     continue
 
                 try:
@@ -362,36 +418,16 @@ class DeltaC:
                     c = concordance_index(
                         test[duration_col], -preds.values.ravel(), test[event_col]
                     )
-                    c_list.append(c)
+                    c_list.append(float(c))
                 except Exception:
-                    c_list.append(0.5)
+                    # A failed fit is a failure, not C = 0.5
+                    c_list.append(np.nan)
 
-        base_c = float(np.mean(base_cs))
-        full_c = float(np.mean(full_cs))
-        delta_c = full_c - base_c
-
-        # Bootstrap CI for Delta-C
-        deltas: List[float] = []
-        for _ in range(self.n_bootstrap):
-            idx = rng.choice(len(base_cs), size=len(base_cs), replace=True)
-            b_base = np.mean([base_cs[i] for i in idx])
-            b_full = np.mean([full_cs[i] for i in idx])
-            deltas.append(b_full - b_base)
-
-        ci = (float(np.percentile(deltas, 2.5)), float(np.percentile(deltas, 97.5)))
-
-        # Approximate p-value
-        p_value = float((np.array(deltas) <= 0).sum() / len(deltas))
-        if p_value == 0:
-            p_value = 1.0 / (len(deltas) + 1)
-
-        return dict(
-            delta_c=delta_c,
-            ci=ci,
-            p_value=p_value,
-            base_c=base_c,
-            full_c=full_c,
-        )
+        fold_deltas = [f - b for b, f in zip(base_cs, full_cs)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN folds
+            base_c, full_c = np.nanmean(base_cs), np.nanmean(full_cs)
+        return self._summarise(fold_deltas, base_c, full_c)
 
 
 class RiskGroupAnalysis:
@@ -447,11 +483,23 @@ class RiskGroupAnalysis:
             return result
 
         if self.method == "quantile":
-            result[group_col] = pd.qcut(
-                result[score_col],
-                q=self.n_groups,
-                labels=list(range(1, self.n_groups + 1)),
+            # Tied scores can collapse quantile edges; qcut with
+            # duplicates="drop" then yields fewer bins than fixed labels.
+            # Label the bins that survive (1 = lowest risk) and warn.
+            codes = pd.qcut(
+                result[score_col], q=self.n_groups, labels=False,
                 duplicates="drop",
+            )
+            n_bins = int(codes.max()) + 1 if codes.notna().any() else 0
+            if n_bins < self.n_groups:
+                warnings.warn(
+                    f"RiskGroupAnalysis: tied '{score_col}' values allow only "
+                    f"{n_bins} of {self.n_groups} quantile groups.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            result[group_col] = pd.Categorical(
+                codes + 1, categories=list(range(1, n_bins + 1)), ordered=True
             )
         elif self.method == "equal_width":
             result[group_col] = pd.cut(

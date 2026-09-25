@@ -46,7 +46,9 @@ def check_informative_censoring(
     duration_col : str
         Follow-up time column.
     event_col : str
-        Event indicator (1 = event, 0 = censored).
+        Event indicator (1 = event, 0 = censored).  cBioPortal-style
+        strings such as ``'1:DECEASED'`` / ``'0:LIVING'`` and booleans are
+        parsed to 0/1.
     biomarker_cols : list of str
         Binary biomarker columns to test.
     covariates : list of str, optional
@@ -65,7 +67,9 @@ def check_informative_censoring(
     Returns
     -------
     list of PitfallWarning
-        One warning per biomarker with biomarker-dependent censoring.
+        One warning per biomarker with biomarker-dependent censoring,
+        plus an INFO warning for each biomarker whose censoring model
+        could not be fitted (so a failure is not read as "no problem").
     """
     from lifelines import CoxPHFitter
 
@@ -86,10 +90,25 @@ def check_informative_censoring(
         )
         return warnings
 
+    try:
+        event = parse_event_indicator(df[event_col])
+    except ValueError as exc:
+        warnings.append(
+            PitfallWarning(
+                pitfall=_PITFALL,
+                message=f"Could not parse event column '{event_col}': {exc}",
+                location=event_col,
+                severity=Severity.WARNING,
+                suggestion="Encode the event column as 0/1 (or 'N:LABEL').",
+            )
+        )
+        return warnings
+
     n_tests = max(len(biomarker_cols), 1)
     for biomarker in biomarker_cols:
-        sub = df[[duration_col, event_col, biomarker] + covariates].dropna().copy()
-        sub["_censored"] = 1 - sub[event_col].astype(int)
+        sub = df[[duration_col, biomarker] + covariates].assign(_event=event)
+        sub = sub.dropna().copy()
+        sub["_censored"] = 1 - sub["_event"].astype(int)
         if sub["_censored"].sum() < min_censored or sub[biomarker].nunique() < 2:
             continue
 
@@ -100,7 +119,20 @@ def check_informative_censoring(
                 duration_col=duration_col,
                 event_col="_censored",
             )
-        except Exception:
+        except Exception as exc:
+            warnings.append(
+                PitfallWarning(
+                    pitfall=_PITFALL,
+                    message=(
+                        f"Censoring model for '{biomarker}' could not be "
+                        f"fitted ({type(exc).__name__}: {exc}); informative "
+                        f"censoring was NOT assessed for this biomarker."
+                    ),
+                    location=biomarker,
+                    severity=Severity.INFO,
+                    suggestion="Inspect the biomarker / covariates for separation or collinearity.",
+                )
+            )
             continue
 
         hr = float(np.exp(cph.params_[biomarker]))
@@ -128,3 +160,30 @@ def check_informative_censoring(
             )
 
     return warnings
+
+
+def parse_event_indicator(series: pd.Series) -> pd.Series:
+    """Parse an event column to float 0/1 (NaN preserved).
+
+    Accepts numeric / boolean values and cBioPortal-style strings such as
+    ``'1:DECEASED'`` or ``'0:LIVING'`` (the integer before ``':'`` is used).
+
+    Raises
+    ------
+    ValueError
+        If non-missing values cannot be parsed or are not 0/1.
+    """
+    if pd.api.types.is_bool_dtype(series) or pd.api.types.is_numeric_dtype(series):
+        parsed = pd.to_numeric(series, errors="coerce").astype(float)
+    else:
+        text = series.astype("string").str.strip().str.split(":").str[0]
+        parsed = pd.to_numeric(text, errors="coerce").astype(float)
+        bad = series.notna() & parsed.isna()
+        if bad.any():
+            raise ValueError(
+                f"unparseable event values, e.g. {series[bad].iloc[0]!r}"
+            )
+    vals = set(parsed.dropna().unique())
+    if not vals.issubset({0.0, 1.0}):
+        raise ValueError(f"event values must be 0/1, got {sorted(vals)[:5]}")
+    return parsed

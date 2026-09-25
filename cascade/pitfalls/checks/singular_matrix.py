@@ -25,10 +25,18 @@ def check_singular_matrix(
 ) -> List[PitfallWarning]:
     """Check for singularity or near-singularity in a feature matrix.
 
+    All checks are run on the **centred and unit-variance scaled**
+    matrix, which is equivalent to including an intercept (a Cox
+    baseline hazard absorbs any constant) and makes the checks
+    scale-invariant: a constant column, an exact linear combination
+    that involves the intercept (e.g. ``RATE = (N - 1) / 6``) or a full
+    set of dummy indicators are caught, while a column that is merely
+    rescaled (e.g. days vs. years) is not flagged.
+
     Performs three checks:
 
-    1. **Condition number**: If the condition number exceeds
-       ``condition_threshold``, the matrix is ill-conditioned.
+    1. **Condition number**: If the condition number of the standardised
+       matrix exceeds ``condition_threshold``, it is ill-conditioned.
     2. **Rank deficiency**: If rank < n_columns, identifies which
        columns are linearly dependent.
     3. **Specific column diagnosis**: Uses SVD to identify which
@@ -81,9 +89,21 @@ def check_singular_matrix(
         )
         return warnings
 
+    # Standardise: centre (absorbs intercept) and scale (scale-invariance).
+    # Constant columns become exact zero columns (rank-deficient).
+    means = X_clean.mean(axis=0)
+    stds = X_clean.std(axis=0)
+    const_mask = ~(stds > 1e-12 * np.maximum(np.abs(means), 1.0))
+    Z = np.zeros_like(X_clean)
+    Z[:, ~const_mask] = (X_clean[:, ~const_mask] - means[~const_mask]) / stds[~const_mask]
+    X_clean = Z
+
     # --- Check 1: Condition number ---
     try:
-        cond = np.linalg.cond(X_clean)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cond = np.linalg.cond(X_clean)
+        if not np.isfinite(cond):
+            cond = np.inf
         if cond > condition_threshold:
             warnings.append(
                 PitfallWarning(
@@ -113,13 +133,17 @@ def check_singular_matrix(
             )
         )
 
-    # --- Check 2: Rank deficiency ---
+    # --- Check 2: Rank deficiency (relative SVD tolerance on unit-scaled
+    # columns, so the test is scale-invariant) ---
     rank = np.linalg.matrix_rank(X_clean)
     if rank < n_features:
         n_redundant = n_features - rank
 
         # --- Check 3: Identify problematic columns via SVD ---
         problematic_cols = _identify_redundant_columns(X_clean, col_names, rank)
+        # Constant columns are always redundant with the intercept
+        const_cols = [c for c, m in zip(col_names, const_mask) if m]
+        problematic_cols = const_cols + [c for c in problematic_cols if c not in const_cols]
 
         warnings.append(
             PitfallWarning(

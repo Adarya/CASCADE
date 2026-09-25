@@ -61,7 +61,9 @@ def phi_coefficient(
     if n < 4:
         raise ValueError("Need at least 4 observations.")
 
-    # Phi = Pearson r for binary variables
+    # Phi = Pearson r for binary variables (NaN if either is constant)
+    if np.unique(x).size < 2 or np.unique(y).size < 2:
+        return np.nan, np.nan, np.nan
     phi = np.corrcoef(x, y)[0, 1]
 
     if np.isnan(phi):
@@ -86,6 +88,7 @@ def tost_equivalence(
     x: np.ndarray,
     y: np.ndarray,
     equivalence_bound: float,
+    alpha: float = 0.05,
 ) -> Tuple[bool, float, float]:
     """Two One-Sided Tests (TOST) for equivalence of means.
 
@@ -98,6 +101,8 @@ def tost_equivalence(
         Two samples to compare.
     equivalence_bound : float
         Maximum allowable difference in means (symmetric bound).
+    alpha : float, default 0.05
+        Significance level of each one-sided test.
 
     Returns
     -------
@@ -124,7 +129,7 @@ def tost_equivalence(
         # Identical samples
         p1 = 0.0 if mean_diff >= -equivalence_bound else 1.0
         p2 = 0.0 if mean_diff <= equivalence_bound else 1.0
-        return (p1 < 0.05 and p2 < 0.05), p1, p2
+        return (p1 < alpha and p2 < alpha), p1, p2
 
     # Test 1: H0: mean_diff <= -bound  vs  H1: mean_diff > -bound
     t1 = (mean_diff - (-equivalence_bound)) / se
@@ -134,7 +139,7 @@ def tost_equivalence(
     t2 = (mean_diff - equivalence_bound) / se
     p2 = stats.t.cdf(t2, df)  # lower tail
 
-    reject = (p1 < 0.05) and (p2 < 0.05)
+    reject = (p1 < alpha) and (p2 < alpha)
     return bool(reject), float(p1), float(p2)
 
 
@@ -148,8 +153,15 @@ def bayes_factor_independence(
     """Approximate Bayes factor for independence in a 2x2 table.
 
     Uses the BIC approximation:
-        BF10 ~ exp((BIC_H0 - BIC_H1) / 2)
-    where H0 is independence and H1 is association.
+        BF10 ~ exp((BIC_H0 - BIC_H1) / 2) = exp((G2 - dof * ln n) / 2)
+    where H0 is independence and H1 is association, and G2 is the
+    likelihood-ratio (deviance) statistic of the independence model.
+    The BIC difference is defined in terms of the log-likelihood ratio,
+    so G2 (not Pearson's chi-square, which only approximates it) is used.
+
+    Returns NaN when the table is degenerate (empty, or a zero row/column
+    margin, i.e. one variable is constant), because the association
+    model is then not identifiable.
 
     A BF10 > 1 supports association; BF10 < 1 (i.e., 1/BF10 > 1)
     supports independence.
@@ -170,15 +182,17 @@ def bayes_factor_independence(
         raise ValueError("contingency_table must be 2x2.")
 
     n = table.sum()
-    if n == 0:
+    if n == 0 or (table.sum(axis=0) == 0).any() or (table.sum(axis=1) == 0).any():
         return np.nan
 
-    # Chi-squared statistic
-    chi2, p, dof, expected = stats.chi2_contingency(table, correction=False)
+    # Likelihood-ratio G^2 statistic (deviance of the independence model)
+    g2, p, dof, expected = stats.chi2_contingency(
+        table, correction=False, lambda_="log-likelihood"
+    )
 
-    # BIC approximation: BIC_H0 - BIC_H1 = chi2 - dof * ln(n)
+    # BIC approximation: BIC_H0 - BIC_H1 = G2 - dof * ln(n)
     # For a 2x2 table, dof = 1
-    bic_diff = chi2 - dof * np.log(n)
+    bic_diff = g2 - dof * np.log(n)
     bf10 = np.exp(bic_diff / 2.0)
 
     return float(bf10)
@@ -214,8 +228,19 @@ def independence_suite(
         - ``kendall_tau``, ``kendall_p`` : Kendall's tau
         - ``cramers_v`` : Cramer's V statistic
         - ``discordance_rate`` : Fraction of pairs where x != y
-        - ``bf10`` : Bayes factor for association
+        - ``bf10`` : Bayes factor for association (BIC approximation
+          based on the likelihood-ratio G^2)
         - ``n`` : Sample size
+        - ``phi_p`` : p-value for phi (equal to ``chi2_p`` for a 2x2 table)
+        - ``independent`` : summary flag using the same rule as
+          ``ArtifactGuard``'s fallback: ``True`` if ``chi2_p > 0.05`` or
+          ``|phi| < 0.1``; ``False`` otherwise; ``None`` when not
+          evaluable (too few observations or a constant variable)
+        - ``note`` : str, explanation when a statistic is NaN (e.g. a
+          constant variable); empty string otherwise
+
+        Statistics that cannot be computed (e.g. because one variable is
+        constant) are returned as NaN rather than raising.
     """
     xb = np.asarray(x_binary, dtype=float)
     yb = np.asarray(y_binary, dtype=float)
@@ -229,17 +254,26 @@ def independence_suite(
     yb = yb[mask]
     n = len(xb)
 
-    result: Dict[str, Any] = {"n": n}
+    result: Dict[str, Any] = {"n": n, "independent": None, "note": ""}
 
     if n < 4:
         # Not enough data for meaningful tests
         for key in [
             "chi2_stat", "chi2_p", "phi", "phi_ci_lower", "phi_ci_upper",
             "spearman_rho", "spearman_p", "kendall_tau", "kendall_p",
-            "cramers_v", "discordance_rate", "bf10",
+            "cramers_v", "discordance_rate", "bf10", "phi_p",
         ]:
             result[key] = np.nan
+        result["note"] = f"Too few observations (n={n}) for independence tests."
         return result
+
+    notes = []
+    constant = [name for name, v in (("x", xb), ("y", yb)) if np.unique(v).size < 2]
+    if constant:
+        notes.append(
+            f"Variable(s) {constant} constant; association statistics are "
+            f"undefined (NaN)."
+        )
 
     # Contingency table
     table = np.array([
@@ -250,11 +284,14 @@ def independence_suite(
 
     # Chi-squared
     try:
+        if constant:
+            raise ValueError("constant variable")
         chi2, chi2_p, _, _ = stats.chi2_contingency(table, correction=True)
     except Exception:
         chi2, chi2_p = np.nan, np.nan
     result["chi2_stat"] = float(chi2)
     result["chi2_p"] = float(chi2_p)
+    result["phi_p"] = float(chi2_p)
 
     # Phi coefficient
     phi_val, phi_lo, phi_hi = phi_coefficient(xb, yb)
@@ -283,7 +320,7 @@ def independence_suite(
         xc = xc[cmask]
         yc = yc[cmask]
 
-    if len(xc) >= 4 and len(yc) >= 4:
+    if len(xc) >= 4 and len(yc) >= 4 and np.unique(xc).size > 1 and np.unique(yc).size > 1:
         rho, sp = stats.spearmanr(xc, yc)
         result["spearman_rho"] = float(rho)
         result["spearman_p"] = float(sp)
@@ -298,8 +335,18 @@ def independence_suite(
         result["kendall_p"] = np.nan
 
     # Bayes factor
-    result["bf10"] = bayes_factor_independence(table)
+    try:
+        result["bf10"] = bayes_factor_independence(table)
+    except Exception as exc:
+        result["bf10"] = np.nan
+        notes.append(f"Bayes factor failed: {exc}")
 
+    if np.isfinite(result["chi2_p"]) and np.isfinite(result["phi"]):
+        # Same rule as ArtifactGuard.independence_decision: P > 0.05 and |phi| < 0.1
+        result["independent"] = bool(
+            result["chi2_p"] > 0.05 and abs(result["phi"]) < 0.1
+        )
+    result["note"] = " ".join(notes)
     return result
 
 

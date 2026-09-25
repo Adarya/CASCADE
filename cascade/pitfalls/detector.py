@@ -8,7 +8,7 @@ who want a one-call scan of their analysis for known pitfalls.
 """
 
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -43,7 +43,10 @@ class PitfallDetector:
     >>> for w in warnings:
     ...     print(w)
 
-    >>> detector.check_all(data_file="data.txt", feature_matrix=X)
+    >>> detector.check_all(data_file="data.txt", feature_matrix=X,
+    ...                    survival_df=df, duration_col="OS_MONTHS",
+    ...                    event_col="OS_STATUS", biomarker_cols=["KRAS"],
+    ...                    center_col="CENTER")
     >>> print(detector.summary())
     """
 
@@ -90,6 +93,13 @@ class PitfallDetector:
         ci_lower_col: str = "ci_lower",
         ci_upper_col: str = "ci_upper",
         subgroup_label: Optional[str] = None,
+        survival_df: Optional[pd.DataFrame] = None,
+        duration_col: Optional[str] = None,
+        event_col: Optional[str] = None,
+        biomarker_cols: Optional[List[str]] = None,
+        center_col: Optional[str] = None,
+        survival_covariates: Optional[List[str]] = None,
+        followup_col: Optional[str] = None,
     ) -> List[PitfallWarning]:
         """Run all applicable checks given the supplied artifacts.
 
@@ -115,8 +125,9 @@ class PitfallDetector:
             Column name for landmark date in ``model_df``.
         covariate_cols : list of str, optional
             Covariate column names for leakage check.
-        event_date_cols : list of str, optional
-            Event date columns for direct leakage detection.
+        event_date_cols : dict or list of str, optional
+            Exposure-date columns for direct leakage detection; preferably
+            ``{covariate: exposure_date_col}``.
         results_df : pd.DataFrame, optional
             Model results dataframe for separation check.
         ci_lower_col : str
@@ -125,6 +136,22 @@ class PitfallDetector:
             Upper CI column name in results_df (default 'ci_upper').
         subgroup_label : str, optional
             Label for the current subgroup context.
+        survival_df : pd.DataFrame, optional
+            One-row-per-patient survival data for informative censoring
+            (#10) and centre effect (#11).  Defaults to ``model_df``.
+        duration_col, event_col : str, optional
+            Follow-up time and event columns in ``survival_df``.
+        biomarker_cols : list of str, optional
+            Binary biomarker columns.  #10 runs when ``survival_df`` (or
+            ``model_df``), ``duration_col``, ``event_col`` and
+            ``biomarker_cols`` are supplied; #11 additionally needs
+            ``center_col``.
+        center_col : str, optional
+            Centre / batch column for Pitfall #11.
+        survival_covariates : list of str, optional
+            Adjustment covariates for the #10 / #11 Cox models.
+        followup_col : str, optional
+            Follow-up time column for the heuristic leakage check (#2).
 
         Returns
         -------
@@ -145,7 +172,8 @@ class PitfallDetector:
         ):
             new_warnings.extend(
                 check_landmark_leakage(
-                    model_df, landmark_date_col, covariate_cols, event_date_cols
+                    model_df, landmark_date_col, covariate_cols, event_date_cols,
+                    followup_col=followup_col,
                 )
             )
 
@@ -163,6 +191,28 @@ class PitfallDetector:
             new_warnings.extend(
                 check_separation_problems(results_df, ci_lower_col, ci_upper_col)
             )
+
+        # Pitfalls #10, #11: survival-data checks
+        surv = survival_df if survival_df is not None else model_df
+        if (
+            surv is not None
+            and duration_col is not None
+            and event_col is not None
+            and biomarker_cols
+        ):
+            new_warnings.extend(
+                _check_censoring(
+                    surv, duration_col, event_col, list(biomarker_cols),
+                    survival_covariates,
+                )
+            )
+            if center_col is not None:
+                new_warnings.extend(
+                    _check_center(
+                        surv, duration_col, event_col, list(biomarker_cols),
+                        center_col, survival_covariates,
+                    )
+                )
 
         self._warnings.extend(new_warnings)
         return new_warnings
@@ -198,7 +248,8 @@ class PitfallDetector:
         df: pd.DataFrame,
         landmark_col: str,
         covariate_cols: List[str],
-        timeline_cols: Optional[List[str]] = None,
+        timeline_cols: Optional[Union[List[str], Dict[str, str]]] = None,
+        followup_col: Optional[str] = None,
     ) -> List[PitfallWarning]:
         """Check for covariate leakage in landmark models (Pitfall #2).
 
@@ -210,14 +261,18 @@ class PitfallDetector:
             Column with landmark dates.
         covariate_cols : list of str
             Covariates to check.
-        timeline_cols : list of str, optional
-            Event date columns for direct leakage detection.
+        timeline_cols : dict or list of str, optional
+            Exposure-date columns, preferably ``{covariate: date_col}``.
+        followup_col : str, optional
+            Follow-up time column for the heuristic mode.
 
         Returns
         -------
         list of PitfallWarning
         """
-        result = check_landmark_leakage(df, landmark_col, covariate_cols, timeline_cols)
+        result = check_landmark_leakage(
+            df, landmark_col, covariate_cols, timeline_cols, followup_col=followup_col
+        )
         self._warnings.extend(result)
         return result
 

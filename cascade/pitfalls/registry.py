@@ -3,7 +3,7 @@ CASCADE Pitfall Registry
 ========================
 
 Extensible registry for managing the pitfall catalog. Pre-populated
-with the 9 canonical pitfalls from the library. Supports community
+with the 11 canonical pitfalls from the library. Supports community
 contributions via the register() method.
 """
 
@@ -27,7 +27,9 @@ class PitfallRegistry:
     --------
     >>> registry = PitfallRegistry()
     >>> len(registry.list_all())
-    9
+    11
+    >>> len(registry.list_automatable(include_partial=False))  # fully automated
+    7
     >>> registry.get(1).name
     'Comment header corruption (#hex in STYLE_COLOR)'
     >>> registry.list_by_category(PitfallCategory.STATISTICAL)
@@ -120,15 +122,27 @@ class PitfallRegistry:
             key=lambda p: p.id,
         )
 
-    def list_automatable(self) -> List[Pitfall]:
-        """Return pitfalls that can be fully or partially automated.
+    def list_automatable(self, include_partial: bool = True) -> List[Pitfall]:
+        """Return pitfalls with automated detection.
+
+        Parameters
+        ----------
+        include_partial : bool, default True
+            If True, include PARTIAL (partially automatable) pitfalls as
+            well as fully AUTOMATED ones; for the canonical library this
+            returns 9 (7 AUTOMATED + 2 PARTIAL).  If False, return only
+            the fully automated pitfalls (7 of the 11 canonical ones --
+            the count reported in the paper).
 
         Returns
         -------
         list of Pitfall
-            Pitfalls with detectability AUTOMATED or PARTIAL.
+            Pitfalls with detectability AUTOMATED (and PARTIAL if
+            ``include_partial``).
         """
-        automatable = {Detectability.AUTOMATED, Detectability.PARTIAL}
+        automatable = {Detectability.AUTOMATED}
+        if include_partial:
+            automatable.add(Detectability.PARTIAL)
         return sorted(
             [p for p in self._pitfalls.values() if p.detectability in automatable],
             key=lambda p: p.id,

@@ -9,6 +9,7 @@ between two nested Cox models.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -28,6 +29,13 @@ class BootstrapCI:
         Confidence level (e.g. 0.95 for 95% CI).
     seed : int, default 42
         Random seed for reproducibility.
+
+    Attributes
+    ----------
+    n_failed_ : int
+        Number of resamples in the last :meth:`run` whose statistic
+        raised or returned NaN (excluded from the interval; a
+        ``RuntimeWarning`` is emitted when this is non-zero).
     """
 
     def __init__(
@@ -39,6 +47,7 @@ class BootstrapCI:
         self.n_bootstrap = n_bootstrap
         self.ci_level = ci_level
         self.seed = seed
+        self.n_failed_ = 0
 
     def run(
         self,
@@ -94,8 +103,10 @@ class BootstrapCI:
                 except Exception:
                     boot_values[i] = np.nan
 
-        # Remove NaN values
+        # Remove NaN values (failed resamples), reporting how many
         valid = boot_values[~np.isnan(boot_values)]
+        self.n_failed_ = int(self.n_bootstrap - len(valid))
+        _warn_failed(self.n_failed_, self.n_bootstrap, "BootstrapCI")
         if len(valid) == 0:
             return point, np.nan, np.nan
 
@@ -116,7 +127,17 @@ def bootstrap_delta_c(
     penalizer: float = 0.01,
     seed: int = 42,
 ) -> Tuple[float, float, float, float]:
-    """Bootstrap the difference in concordance between two nested Cox models.
+    """Descriptive bootstrap interval for the apparent concordance difference.
+
+    .. warning::
+       Each resample fits **and** scores both models on the same data
+       (training / apparent C-index), so the estimate and its interval
+       are optimistic: adding pure-noise covariates yields a positive
+       delta-C.  The interval is therefore **descriptive only** and no
+       p-value is computed (the fourth return value is always NaN and
+       is kept for backward compatibility).  Use
+       :func:`cascade.stats.cross_validate.cv_delta_c` (out-of-sample
+       concordance) for inference on added discriminative value.
 
     Parameters
     ----------
@@ -140,14 +161,18 @@ def bootstrap_delta_c(
     Returns
     -------
     delta_c : float
-        Point estimate of C_full - C_base on the original data.
+        Apparent (in-sample) C_full - C_base on the original data.
     ci_lower : float
-        Lower 95% CI for delta_c.
+        Lower 2.5th percentile of the bootstrap apparent delta-C
+        (descriptive, not optimism-corrected).
     ci_upper : float
-        Upper 95% CI for delta_c.
+        Upper 97.5th percentile of the bootstrap apparent delta-C.
     p_value : float
-        Approximate p-value from the bootstrap distribution
-        (proportion of bootstrap deltas <= 0).
+        Always NaN.  An in-sample bootstrap p-value is biased toward
+        significance; use ``cv_delta_c`` instead.
+
+    Failed resamples (fit errors, too few rows) are excluded and their
+    number is reported via a ``RuntimeWarning``.
     """
     base_vars = list(model_vars_base)
     full_vars = list(model_vars_full)
@@ -193,11 +218,23 @@ def bootstrap_delta_c(
             boot_deltas[i] = np.nan
 
     valid = boot_deltas[~np.isnan(boot_deltas)]
+    _warn_failed(n_bootstrap - len(valid), n_bootstrap, "bootstrap_delta_c")
     if len(valid) == 0:
         return delta_c, np.nan, np.nan, np.nan
 
     ci_lower = float(np.percentile(valid, 2.5))
     ci_upper = float(np.percentile(valid, 97.5))
-    p_value = float(np.mean(valid <= 0))
 
-    return float(delta_c), ci_lower, ci_upper, p_value
+    # No p-value: the apparent-C bootstrap is optimistic (see docstring).
+    return float(delta_c), ci_lower, ci_upper, np.nan
+
+
+def _warn_failed(n_failed: int, n_total: int, where: str) -> None:
+    """Emit a RuntimeWarning reporting failed bootstrap resamples."""
+    if n_failed > 0:
+        warnings.warn(
+            f"{where}: {n_failed}/{n_total} bootstrap resamples failed and "
+            f"were excluded from the interval.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
