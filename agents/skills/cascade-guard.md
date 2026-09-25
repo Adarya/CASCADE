@@ -40,7 +40,7 @@ Any figures produced (e.g., mosaic plots, independence scatters) MUST follow the
 - See `CLAUDE.md > Figure Standards` for the full matplotlib rcParams block
 
 ## Post-Execution Validation
-- [ ] All 6 automated checks ran without errors
+- [ ] All 8 automated checks ran without errors
 - [ ] No CRITICAL warnings remain unresolved
 - [ ] Audit prompts for manual checks displayed
 - [ ] Fix suggestions provided for all detected issues

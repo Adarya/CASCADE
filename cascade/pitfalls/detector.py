@@ -21,6 +21,8 @@ from .checks.collinearity import check_collinearity as _check_collinearity
 from .checks.constant_variable import check_constant_variables as _check_constant
 from .checks.separation import check_separation_problems
 from .checks.singular_matrix import check_singular_matrix as _check_singular
+from .checks.informative_censoring import check_informative_censoring as _check_censoring
+from .checks.center_effect import check_center_effect as _check_center
 
 
 class PitfallDetector:
@@ -313,6 +315,88 @@ class PitfallDetector:
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
+
+    def check_informative_censoring(
+        self,
+        df: pd.DataFrame,
+        duration_col: str,
+        event_col: str,
+        biomarker_cols: List[str],
+        covariates: Optional[List[str]] = None,
+        alpha: float = 0.05,
+        min_hr: float = 1.25,
+    ) -> List[PitfallWarning]:
+        """Check whether censoring depends on the biomarker (Pitfall #10).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Analysis dataframe, one row per patient.
+        duration_col : str
+            Follow-up time column.
+        event_col : str
+            Event indicator column (1 = event, 0 = censored).
+        biomarker_cols : list of str
+            Binary biomarker columns to test.
+        covariates : list of str, optional
+            Adjustment covariates for the censoring model.
+        alpha : float
+            Family-wise significance level (default 0.05).
+        min_hr : float
+            Minimum censoring hazard ratio to flag (default 1.25).
+
+        Returns
+        -------
+        list of PitfallWarning
+        """
+        result = _check_censoring(
+            df, duration_col, event_col, biomarker_cols, covariates, alpha, min_hr
+        )
+        self._warnings.extend(result)
+        return result
+
+    def check_center_effect(
+        self,
+        df: pd.DataFrame,
+        duration_col: str,
+        event_col: str,
+        biomarker_cols: List[str],
+        center_col: str,
+        covariates: Optional[List[str]] = None,
+        alpha: float = 0.05,
+        prevalence_range: float = 0.15,
+    ) -> List[PitfallWarning]:
+        """Check for centre / batch effects (Pitfall #11).
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Analysis dataframe, one row per patient.
+        duration_col : str
+            Follow-up time column.
+        event_col : str
+            Event indicator column (1 = event, 0 = censored).
+        biomarker_cols : list of str
+            Binary biomarker columns to test.
+        center_col : str
+            Column identifying the contributing centre or batch.
+        covariates : list of str, optional
+            Adjustment covariates for the Cox models.
+        alpha : float
+            Family-wise significance level (default 0.05).
+        prevalence_range : float
+            Absolute prevalence range across centres to flag (default 0.15).
+
+        Returns
+        -------
+        list of PitfallWarning
+        """
+        result = _check_center(
+            df, duration_col, event_col, biomarker_cols, center_col,
+            covariates, alpha, prevalence_range,
+        )
+        self._warnings.extend(result)
+        return result
 
     def summary(self) -> str:
         """Generate a formatted summary of all accumulated warnings.

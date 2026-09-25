@@ -32,15 +32,15 @@ class TestPitfallLibrary:
 
     def test_pitfall_library_count(self):
         """PITFALL_LIBRARY should contain exactly 9 items."""
-        assert len(PITFALL_LIBRARY) == 9, (
-            f"Expected 9 pitfalls in the library, got {len(PITFALL_LIBRARY)}."
+        assert len(PITFALL_LIBRARY) == 11, (
+            f"Expected 11 pitfalls in the library, got {len(PITFALL_LIBRARY)}."
         )
 
     def test_pitfall_library_ids(self):
         """Pitfall IDs should be 1 through 9."""
         ids = sorted(p.id for p in PITFALL_LIBRARY)
-        assert ids == list(range(1, 10)), (
-            f"Expected pitfall IDs 1-9, got {ids}."
+        assert ids == list(range(1, 12)), (
+            f"Expected pitfall IDs 1-11, got {ids}."
         )
 
     def test_pitfall_library_types(self):
@@ -66,10 +66,10 @@ class TestPitfallRegistry:
     """Tests for the extensible pitfall registry."""
 
     def test_registry_preloaded(self):
-        """Default registry should have 9 pitfalls pre-loaded."""
+        """Default registry should have 11 pitfalls pre-loaded."""
         registry = PitfallRegistry()
-        assert len(registry) == 9, (
-            f"Default registry should have 9 pitfalls, got {len(registry)}."
+        assert len(registry) == 11, (
+            f"Default registry should have 11 pitfalls, got {len(registry)}."
         )
 
     def test_registry_empty(self):
@@ -385,3 +385,76 @@ class TestDetectorOrchestrator:
         assert len(detector.warnings) == 0, (
             "After clear(), warnings should be empty."
         )
+
+
+def _survival_frame(n=600, seed=0):
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        "gene": rng.integers(0, 2, n),
+        "age": rng.normal(65, 8, n),
+        "center": rng.choice(["A", "B", "C"], n),
+    })
+    df["t_event"] = rng.exponential(24, n)
+    return df, rng
+
+
+class TestInformativeCensoring:
+    """Tests for biomarker-dependent censoring detection (Pitfall #10)."""
+
+    def test_informative_censoring_detected(self):
+        df, rng = _survival_frame()
+        # carriers are censored much earlier than non-carriers
+        t_cens = rng.exponential(np.where(df["gene"] == 1, 8, 40))
+        df["time"] = np.minimum(df["t_event"], t_cens)
+        df["event"] = (df["t_event"] <= t_cens).astype(int)
+        detector = PitfallDetector()
+        warnings = detector.check_informative_censoring(
+            df, "time", "event", ["gene"], covariates=["age"]
+        )
+        assert len(warnings) == 1
+        assert warnings[0].pitfall.id == 10
+        assert "earlier" in warnings[0].message
+
+    def test_noninformative_censoring_no_warning(self):
+        df, rng = _survival_frame(seed=1)
+        t_cens = rng.exponential(30, len(df))
+        df["time"] = np.minimum(df["t_event"], t_cens)
+        df["event"] = (df["t_event"] <= t_cens).astype(int)
+        detector = PitfallDetector()
+        assert detector.check_informative_censoring(df, "time", "event", ["gene"]) == []
+
+    def test_missing_columns_reported(self):
+        df, _ = _survival_frame()
+        detector = PitfallDetector()
+        warnings = detector.check_informative_censoring(df, "time", "event", ["gene"])
+        assert len(warnings) == 1 and "Missing columns" in warnings[0].message
+
+
+class TestCenterEffect:
+    """Tests for centre / batch effect detection (Pitfall #11)."""
+
+    def test_prevalence_heterogeneity_detected(self):
+        df, rng = _survival_frame(seed=2)
+        prev = df["center"].map({"A": 0.10, "B": 0.30, "C": 0.60})
+        df["gene"] = (rng.random(len(df)) < prev).astype(int)
+        df["time"], df["event"] = df["t_event"], 1
+        detector = PitfallDetector()
+        warnings = detector.check_center_effect(df, "time", "event", ["gene"], "center")
+        assert any("Prevalence" in w.message for w in warnings)
+        assert all(w.pitfall.id == 11 for w in warnings)
+
+    def test_effect_heterogeneity_detected(self):
+        df, rng = _survival_frame(n=1500, seed=3)
+        # gene is harmful in centre A, protective in centre C
+        log_hr = df["center"].map({"A": 1.0, "B": 0.0, "C": -1.0}) * df["gene"]
+        df["time"] = rng.exponential(24 / np.exp(log_hr))
+        df["event"] = 1
+        detector = PitfallDetector()
+        warnings = detector.check_center_effect(df, "time", "event", ["gene"], "center")
+        assert any("interaction" in w.message for w in warnings)
+
+    def test_homogeneous_centres_no_warning(self):
+        df, _ = _survival_frame(seed=4)
+        df["time"], df["event"] = df["t_event"], 1
+        detector = PitfallDetector()
+        assert detector.check_center_effect(df, "time", "event", ["gene"], "center") == []

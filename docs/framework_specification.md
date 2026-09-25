@@ -2,7 +2,7 @@
 
 **Clinical Assessment & Systematic Cascade for Agentic Discovery & Evaluation**
 
-Specification v1.0 · package v0.3.0 · June 2026
+Specification v1.0 · package v0.4.0 · June 2026
 
 ---
 
@@ -391,7 +391,7 @@ Assign confidence tiers (High, Moderate, Low) based on the maximum consensus pro
 
 ## 4. The Pitfall Library
 
-CASCADE maintains a structured catalog of empirically discovered analytical pitfalls. Each pitfall was first identified during one of the source studies and has been generalized to apply across clinical genomics analyses.
+CASCADE maintains a structured catalog of empirically discovered analytical pitfalls. Pitfalls 1–9 were first identified during the source studies and generalized to apply across clinical genomics analyses; pitfalls 10–11 were added in v0.4.0 for failure modes common in multi-institutional observational cohorts.
 
 ### Pitfall Registry
 
@@ -406,6 +406,8 @@ CASCADE maintains a structured catalog of empirically discovered analytical pitf
 | 7 | Singular matrix from constant covariate in subgroup | Statistical | CRITICAL | Automated | 5 |
 | 8 | Fabricated citation by AI agent | Communication | CRITICAL | Partial | 8 |
 | 9 | Performance status floor effect (ECOG paradox) | Statistical | WARNING | Partial | 5 |
+| 10 | Informative (biomarker-dependent) censoring | Statistical | WARNING | Automated | 5 |
+| 11 | Centre or batch effect in multi-institutional cohorts | Statistical | WARNING | Automated | 5, 7 |
 
 ### Detailed Pitfall Specifications
 

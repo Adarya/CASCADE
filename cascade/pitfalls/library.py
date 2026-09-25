@@ -375,4 +375,68 @@ PITFALL_LIBRARY: List[Pitfall] = [
             "longest median survival (38.0 months)."
         ),
     ),
+    Pitfall(
+        id=10,
+        name="Informative (biomarker-dependent) censoring",
+        description=(
+            "Cox models assume that censoring is unrelated to the outcome "
+            "given the covariates. In observational genomic cohorts, "
+            "carriers and non-carriers of a biomarker can differ in "
+            "follow-up (later panel adoption, referral patterns, loss to "
+            "follow-up), so the censoring process depends on the biomarker "
+            "and the hazard ratio can be biased."
+        ),
+        category=PitfallCategory.STATISTICAL,
+        severity=Severity.WARNING,
+        detectability=Detectability.AUTOMATED,
+        detection_strategy=(
+            "Fit a reverse-censoring Cox model per biomarker (censoring as "
+            "the event). Flag biomarkers whose censoring hazard ratio is "
+            "significant after Bonferroni adjustment and at least 1.25-fold "
+            "in either direction."
+        ),
+        fix_strategy=(
+            "Compare follow-up by biomarker status, adjust for the driver "
+            "of differential follow-up (sequencing date, institution), and "
+            "report an inverse-probability-of-censoring-weighted "
+            "sensitivity analysis."
+        ),
+        source_study="Added in v0.4.0 in response to peer review",
+        example=(
+            "A gene added to a sequencing panel in a later version is only "
+            "observed in recently sequenced patients, who have shorter "
+            "follow-up and are censored earlier than non-carriers."
+        ),
+    ),
+    Pitfall(
+        id=11,
+        name="Centre or batch effect in multi-institutional cohorts",
+        description=(
+            "In multi-institutional data, biomarker prevalence can differ "
+            "across centres (panel coverage, referral mix), confounding "
+            "the association, and the biomarker effect itself can differ "
+            "across centres. Pooling without stratification can create or "
+            "mask associations."
+        ),
+        category=PitfallCategory.STATISTICAL,
+        severity=Severity.WARNING,
+        detectability=Detectability.AUTOMATED,
+        detection_strategy=(
+            "Per biomarker: chi-square test and absolute range of "
+            "prevalence across centres; likelihood-ratio test of a "
+            "biomarker-by-centre interaction in a centre-stratified Cox "
+            "model. Bonferroni adjustment across biomarkers."
+        ),
+        fix_strategy=(
+            "Stratify or adjust by centre, verify panel coverage per "
+            "centre, and report leave-one-centre-out and centre-specific "
+            "estimates."
+        ),
+        source_study="GENIE BPC external validation; formalized in v0.4.0",
+        example=(
+            "In the GENIE BPC NSCLC cohort, gene prevalence ranged widely "
+            "across the four contributing institutions, motivating "
+            "institution-stratified sensitivity analysis."
+        ),
+    ),
 ]

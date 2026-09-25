@@ -11,6 +11,8 @@ from .collinearity import check_collinearity
 from .separation import check_separation_problems
 from .constant_variable import check_constant_variables
 from .singular_matrix import check_singular_matrix
+from .informative_censoring import check_informative_censoring
+from .center_effect import check_center_effect
 
 __all__ = [
     "check_comment_corruption",
@@ -19,4 +21,6 @@ __all__ = [
     "check_separation_problems",
     "check_constant_variables",
     "check_singular_matrix",
+    "check_informative_censoring",
+    "check_center_effect",
 ]

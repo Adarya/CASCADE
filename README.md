@@ -24,8 +24,9 @@ CASCADE formalizes a nine-layer validation methodology (Layers 0–8) that emerg
 
 ### The Pitfall Library
 
-9 empirically catalogued failure modes. Six automated checks provide detection
-for five of them (#1–#4 and #7); the remainder are runtime, manual, or partial:
+11 catalogued failure modes. Eight automated checks provide detection for
+seven of them (#1–#4, #7, #10 and #11); the remainder are runtime, manual, or
+partial:
 
 1. Comment header corruption (`#hex` in STYLE_COLOR columns) — *automated*
 2. Covariate leakage in landmark models (future treatment data) — *automated*
@@ -36,6 +37,8 @@ for five of them (#1–#4 and #7); the remainder are runtime, manual, or partial
 7. Singular matrix from constant covariates in subgroups — *automated*
 8. Fabricated citations by AI agents — *partial* (format/plausibility screen only)
 9. Performance status floor effects (baseline confounding) — *partial*
+10. Informative (biomarker-dependent) censoring — *automated* (v0.4.0)
+11. Centre or batch effects in multi-institutional cohorts — *automated* (v0.4.0)
 
 ## Installation
 
