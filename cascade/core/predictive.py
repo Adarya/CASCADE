@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
+from cascade.core.cohort import parse_event_status
+
 try:
     from cascade.stats.interaction import InteractionCox, InteractionResult
 except ImportError:
@@ -56,13 +58,18 @@ class PredictiveResult:
     hr_untreated : float
         Biomarker HR within the untreated subgroup.
     classification : str
-        ``'predictive'`` if interaction significant, else ``'prognostic'``.
+        ``'predictive'`` if interaction significant, ``'prognostic'`` if the
+        interaction was estimated but not significant, or
+        ``'not_evaluable'`` if the test could not be performed (see
+        *reason*).
     n_treated : int
         Number of treated patients.
     n_untreated : int
         Number of untreated patients.
     converged : bool
         Whether the model converged.
+    reason : str
+        Why the result is ``'not_evaluable'`` (empty otherwise).
     """
 
     gene: str
@@ -72,10 +79,11 @@ class PredictiveResult:
     interaction_ci: tuple = (np.nan, np.nan)
     hr_treated: float = np.nan
     hr_untreated: float = np.nan
-    classification: str = "prognostic"
+    classification: str = "not_evaluable"
     n_treated: int = 0
     n_untreated: int = 0
     converged: bool = False
+    reason: str = ""
 
 
 class PredictiveTest:
@@ -101,6 +109,14 @@ class PredictiveTest:
         Ridge penalty for numerical stability.
     alpha : float, default 0.05
         Significance threshold for the interaction term.
+    min_arm_size : int, default 10
+        Minimum number of patients in each treatment arm; smaller arms
+        yield ``classification='not_evaluable'``.
+
+    Notes
+    -----
+    *event_col* may hold 0/1, booleans or cBioPortal status strings such as
+    ``'1:DECEASED'`` / ``'0:LIVING'``; they are parsed to 0/1 before fitting.
     """
 
     def __init__(
@@ -112,6 +128,7 @@ class PredictiveTest:
         covariates: Optional[Sequence[str]] = None,
         penalizer: float = 0.01,
         alpha: float = 0.05,
+        min_arm_size: int = 10,
     ) -> None:
         self.gene_col = gene_col
         self.treatment_col = treatment_col
@@ -120,6 +137,7 @@ class PredictiveTest:
         self.covariates = list(covariates) if covariates else []
         self.penalizer = penalizer
         self.alpha = alpha
+        self.min_arm_size = min_arm_size
 
     # ------------------------------------------------------------------
     # Single test
@@ -147,14 +165,20 @@ class PredictiveTest:
         # Prepare data
         required = [self.duration_col, self.event_col, self.gene_col, self.treatment_col]
         all_cols = required + self.covariates
-        sub = df[all_cols].dropna()
+        sub = df[all_cols].copy()
+        sub[self.event_col] = sub[self.event_col].map(parse_event_status)
+        sub = sub.dropna()
 
         n_treated = int((sub[self.treatment_col] == 1).sum())
         n_untreated = int((sub[self.treatment_col] == 0).sum())
         result.n_treated = n_treated
         result.n_untreated = n_untreated
 
-        if n_treated < 10 or n_untreated < 10:
+        if n_treated < self.min_arm_size or n_untreated < self.min_arm_size:
+            result.reason = (
+                f"arm size below min_arm_size={self.min_arm_size} "
+                f"(treated={n_treated}, untreated={n_untreated})"
+            )
             return result
 
         # Create interaction term
@@ -169,6 +193,7 @@ class PredictiveTest:
         fit_predictors = [c for c in predictors if sub[c].nunique() > 1]
         if interaction_col not in fit_predictors:
             # Interaction is constant (no variation)
+            result.reason = "no variation in gene x treatment interaction term"
             return result
 
         fit_data = sub[[self.duration_col, self.event_col] + fit_predictors]
@@ -192,10 +217,14 @@ class PredictiveTest:
                     row["exp(coef) lower 95%"],
                     row["exp(coef) upper 95%"],
                 )
-        except Exception:
+        except Exception as exc:
+            result.reason = f"model fit failed: {type(exc).__name__}: {exc}"
             return result
 
         # Classify
+        if pd.isna(result.interaction_p):
+            result.reason = "interaction term not estimated"
+            return result
         result.classification = (
             "predictive" if result.interaction_p < self.alpha else "prognostic"
         )
@@ -248,6 +277,7 @@ class PredictiveTest:
         penalizer: float = 0.01,
         alpha: float = 0.05,
         correction: str = "fdr_bh",
+        min_arm_size: int = 10,
     ) -> pd.DataFrame:
         """Screen multiple genes for predictive interactions with treatment.
 
@@ -263,12 +293,17 @@ class PredictiveTest:
         penalizer : float, default 0.01
         alpha : float, default 0.05
         correction : str, default 'fdr_bh'
+        min_arm_size : int, default 10
+            Minimum patients per treatment arm (see :class:`PredictiveTest`).
 
         Returns
         -------
         DataFrame
-            One row per gene with interaction test results and
-            classification.
+            One row per gene with interaction test results,
+            ``classification`` (``'predictive'`` / ``'prognostic'`` /
+            ``'not_evaluable'``) and ``reason``.  Genes whose interaction
+            could not be tested stay ``'not_evaluable'``; they are never
+            relabelled prognostic.
         """
         results: List[Dict[str, Any]] = []
 
@@ -281,6 +316,7 @@ class PredictiveTest:
                 covariates=covariates,
                 penalizer=penalizer,
                 alpha=alpha,
+                min_arm_size=min_arm_size,
             )
             res = test.run(df)
             results.append({
@@ -296,6 +332,7 @@ class PredictiveTest:
                 "n_treated": res.n_treated,
                 "n_untreated": res.n_untreated,
                 "converged": res.converged,
+                "reason": res.reason,
             })
 
         results_df = pd.DataFrame(results)
@@ -318,9 +355,20 @@ class PredictiveTest:
 
         results_df["significant"] = results_df["interaction_p_adjusted"] < alpha
 
-        # Reclassify based on adjusted p-value
-        results_df["classification"] = np.where(
-            results_df["significant"], "predictive", "prognostic"
+        # Reclassify based on adjusted p-value; untestable genes stay
+        # not_evaluable (a NaN p-value is not evidence of prognostic-only).
+        evaluable = results_df["interaction_p_adjusted"].notna() & (
+            results_df["classification"] != "not_evaluable"
         )
+        results_df["classification"] = np.select(
+            [evaluable & results_df["significant"], evaluable],
+            ["predictive", "prognostic"],
+            default="not_evaluable",
+        )
+        results_df.loc[
+            (results_df["classification"] == "not_evaluable")
+            & (results_df["reason"] == ""),
+            "reason",
+        ] = "interaction p-value not available"
 
         return results_df

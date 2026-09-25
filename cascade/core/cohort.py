@@ -26,6 +26,31 @@ import numpy as np
 import pandas as pd
 
 
+def parse_event_status(value: Any) -> float:
+    """Parse a survival status value to 1 (event), 0 (censored) or NaN.
+
+    Accepts booleans (``True`` = event), numbers (1 / 0) and cBioPortal
+    strings such as ``'1:DECEASED'``, ``'0:LIVING'``, ``'DECEASED'``,
+    ``'LIVING'``, ``'True'`` / ``'False'``.
+    """
+    if value is None:
+        return np.nan
+    if isinstance(value, (bool, np.bool_)):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        if np.isnan(value):
+            return np.nan
+        return 1.0 if value == 1 else (0.0 if value == 0 else np.nan)
+    text = str(value).strip().upper()
+    if not text or text in {"NA", "NAN", "NONE", "UNKNOWN"}:
+        return np.nan
+    if text.startswith("1") or text in {"TRUE", "YES"} or "DECEASED" in text or "DEAD" in text:
+        return 1.0
+    if text.startswith("0") or text in {"FALSE", "NO"} or "LIVING" in text or "ALIVE" in text:
+        return 0.0
+    return np.nan
+
+
 class CohortBuilder:
     """Assembles analysis cohorts from tab-delimited clinical genomics files.
 
@@ -62,12 +87,17 @@ class CohortBuilder:
             Path to the .txt / .tsv file.  If *data_dir* was set and
             *filepath* is relative, it is resolved against *data_dir*.
         comment : str, default '#'
-            Character that marks comment lines in the header.
+            Prefix that marks metadata/comment lines.  Only the contiguous
+            block of lines starting with *comment* at the top of the file
+            (the cBioPortal metadata header) is skipped; '#' characters
+            inside data fields (e.g. hex colour codes in STYLE_COLOR) are
+            preserved.  pandas' ``comment=`` option is never used, because
+            it truncates any data row at the first '#' (Pitfall #1).
+            Pass ``None`` to disable comment handling.
         skip_comment_corruption : bool, default False
-            If ``True``, comment lines are manually stripped before parsing
-            instead of using pandas' ``comment`` parameter.  This avoids
-            corruption of data columns that contain '#' characters (e.g.
-            hex colour codes in STYLE_COLOR).
+            Kept for backward compatibility.  If ``True``, *every* line that
+            starts with *comment* is dropped (not only the leading header
+            block).  Data fields containing '#' are preserved either way.
         **kwargs
             Additional keyword arguments forwarded to ``pd.read_csv``.
 
@@ -79,19 +109,28 @@ class CohortBuilder:
         if not path.is_absolute() and self.data_dir is not None:
             path = self.data_dir / path
 
-        if skip_comment_corruption:
-            # Read file manually, drop comment lines, then parse
+        sep = kwargs.pop("sep", "\t")
+        kwargs.pop("comment", None)  # never let pandas truncate at '#'
+
+        if comment and skip_comment_corruption:
+            # Read file manually, drop all comment lines, then parse
             with open(path, "r", encoding="utf-8") as fh:
                 lines = [
                     line for line in fh if not line.startswith(comment)
                 ]
-            return pd.read_csv(
-                io.StringIO("".join(lines)),
-                sep=kwargs.pop("sep", "\t"),
-                **kwargs,
-            )
+            return pd.read_csv(io.StringIO("".join(lines)), sep=sep, **kwargs)
 
-        return pd.read_csv(path, sep=kwargs.pop("sep", "\t"), comment=comment, **kwargs)
+        n_header = 0
+        if comment:
+            # Count the leading metadata block only
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.startswith(comment):
+                        break
+                    n_header += 1
+        if n_header and "skiprows" not in kwargs:
+            kwargs["skiprows"] = n_header
+        return pd.read_csv(path, sep=sep, **kwargs)
 
     # ------------------------------------------------------------------
     # Cohort filtering
@@ -135,6 +174,7 @@ class CohortBuilder:
         filter_oncogenic: bool = True,
         oncogenic_col: str = "ONCOGENIC",
         oncogenic_values: Optional[Sequence[str]] = None,
+        all_patients: Optional[Sequence[Any]] = None,
     ) -> pd.DataFrame:
         """Build a patient-by-gene binary mutation matrix.
 
@@ -154,25 +194,48 @@ class CohortBuilder:
         oncogenic_values : sequence of str, optional
             Values considered oncogenic.  Defaults to
             ``['Oncogenic', 'Likely Oncogenic']``.
+        all_patients : sequence, optional
+            Full list of profiled patients (or samples).  If given, the
+            matrix is reindexed to exactly these IDs and patients with no
+            qualifying mutation get an all-zero row.  If omitted, only
+            patients with at least one qualifying mutation appear -- callers
+            must then treat patients absent from the matrix as wild-type.
 
         Returns
         -------
         DataFrame
             Binary matrix with patients as rows and genes as columns.
             Index is *patient_col* values.
+
+        Warns
+        -----
+        UserWarning
+            If *filter_oncogenic* is ``True`` but *oncogenic_col* is absent
+            (the filter cannot be applied and all mutations are kept).
         """
         if oncogenic_values is None:
             oncogenic_values = ["Oncogenic", "Likely Oncogenic"]
 
         data = mutations_df.copy()
-        if filter_oncogenic and oncogenic_col in data.columns:
-            data = data.loc[data[oncogenic_col].isin(oncogenic_values)]
+        if filter_oncogenic:
+            if oncogenic_col in data.columns:
+                data = data.loc[data[oncogenic_col].isin(oncogenic_values)]
+            else:
+                warnings.warn(
+                    f"build_mutation_matrix: column '{oncogenic_col}' not found; "
+                    "oncogenic filter NOT applied (all mutations kept).",
+                    stacklevel=2,
+                )
 
         if data.empty:
             warnings.warn(
                 "No mutations remaining after oncogenic filter.",
                 stacklevel=2,
             )
+            if all_patients is not None:
+                return pd.DataFrame(
+                    index=pd.Index(list(dict.fromkeys(all_patients)), name=patient_col)
+                )
             return pd.DataFrame()
 
         # Pivot to binary matrix
@@ -188,6 +251,11 @@ class CohortBuilder:
             )
             .astype(int)
         )
+        if all_patients is not None:
+            matrix = matrix.reindex(
+                pd.Index(list(dict.fromkeys(all_patients)), name=patient_col),
+                fill_value=0,
+            ).astype(int)
         return matrix
 
     # ------------------------------------------------------------------
@@ -206,10 +274,22 @@ class CohortBuilder:
     ) -> pd.DataFrame:
         """Detect treatment lines from a longitudinal treatment timeline.
 
-        Treatment lines are separated by gaps of *gap_days* or more between
-        the STOP_DATE of one treatment and the START_DATE of the next.
-        Agents starting within *concurrent_window* days of each other are
-        considered part of the same regimen.
+        Rule (applied per patient, records sorted by start date):
+
+        1. The first record opens line 1; its start is the line start.
+        2. A record starting within *concurrent_window* days of the current
+           line start joins the line (concurrent regimen components).
+        3. Otherwise, the gap is measured from the latest prior activity
+           date -- the maximum over earlier records of STOP_DATE, or of
+           START_DATE when STOP_DATE is missing or the column is absent.
+           A gap > *gap_days* starts a new line.
+        4. Otherwise (gap <= *gap_days*), a record whose agent is already
+           part of the current line continues that line; a *new* agent
+           added outside the concurrent window starts a new line
+           (switch / escalation).  Without an *agent_col*, only rule 3
+           can split lines.
+
+        Records with a missing START_DATE are assigned to the current line.
 
         Parameters
         ----------
@@ -219,8 +299,9 @@ class CohortBuilder:
         patient_col, start_col, stop_col, agent_col : str
             Column name overrides.
         gap_days : int, default 90
-            Minimum gap (days) between stop and next start to indicate a
-            new treatment line.
+            A gap (days) strictly greater than this between the latest prior
+            stop (or start, if stop is missing) and the next start indicates
+            a new treatment line.
         concurrent_window : int, default 28
             Treatments starting within this many days of each other are
             grouped into the same line.
@@ -246,40 +327,52 @@ class CohortBuilder:
         line_numbers: List[int] = []
         line_starts: List[float] = []
 
+        has_stop = stop_col in df.columns
+        has_agent = agent_col in df.columns
+
+        def _norm(agent: Any) -> Optional[str]:
+            return None if pd.isna(agent) else str(agent).strip().lower()
+
         for _, grp in df.groupby(patient_col, sort=False):
-            grp = grp.sort_values(start_col)
             current_line = 1
-            current_line_start = grp[start_col].iloc[0]
-            prev_stop = None
+            current_line_start = np.nan
+            line_agents: set = set()
+            last_activity = np.nan  # max over prior records of stop (or start)
 
-            for idx, row in grp.iterrows():
+            for _, row in grp.iterrows():
                 start = row[start_col]
-                stop = row.get(stop_col, np.nan) if stop_col in grp.columns else np.nan
+                stop = row[stop_col] if has_stop else np.nan
+                agent = _norm(row[agent_col]) if has_agent else None
 
-                if prev_stop is not None and not np.isnan(prev_stop):
-                    gap = start - prev_stop
-                    if gap > gap_days:
-                        current_line += 1
-                        current_line_start = start
-                    elif abs(start - current_line_start) > concurrent_window:
-                        # Not concurrent with line start and gap is moderate
-                        if gap > concurrent_window:
-                            current_line += 1
-                            current_line_start = start
-                elif prev_stop is not None:
-                    # prev_stop is NaN: check if start is far from line start
-                    if abs(start - current_line_start) > concurrent_window:
-                        current_line += 1
-                        current_line_start = start
+                if pd.isna(start):
+                    line_numbers.append(current_line)
+                    line_starts.append(current_line_start)
+                    continue
+
+                if np.isnan(current_line_start):
+                    current_line_start = start  # first dated record
+                elif start - current_line_start <= concurrent_window:
+                    pass  # concurrent component of the current regimen
+                elif not np.isnan(last_activity) and start - last_activity > gap_days:
+                    current_line += 1
+                    current_line_start = start
+                    line_agents = set()
+                elif agent is not None and agent not in line_agents:
+                    # New agent added outside the concurrent window -> new line
+                    current_line += 1
+                    current_line_start = start
+                    line_agents = set()
+
+                if agent is not None:
+                    line_agents.add(agent)
 
                 line_numbers.append(current_line)
                 line_starts.append(current_line_start)
 
-                if not np.isnan(stop) if isinstance(stop, (int, float)) else stop is not None:
-                    if prev_stop is None or np.isnan(prev_stop):
-                        prev_stop = stop
-                    else:
-                        prev_stop = max(prev_stop, stop)
+                activity = stop if pd.notna(stop) else start
+                last_activity = (
+                    activity if np.isnan(last_activity) else max(last_activity, activity)
+                )
 
         df["LINE_NUMBER"] = line_numbers
         df["LINE_START"] = line_starts
@@ -420,7 +513,10 @@ class CohortBuilder:
             *anchor_dates* augmented with one binary column per unique site.
         """
         all_sites = sorted(site_timeline[site_col].dropna().unique())
-        result = anchor_dates.copy()
+        # Work on a positional index internally (the caller's index may
+        # contain duplicate labels, e.g. after pd.concat); restore it at the end.
+        original_index = anchor_dates.index
+        result = anchor_dates.reset_index(drop=True)
 
         # Initialise all site columns to 0
         for site in all_sites:
@@ -446,6 +542,7 @@ class CohortBuilder:
                 if site in result.columns:
                     result.at[i, site] = 1
 
+        result.index = original_index
         return result
 
 
@@ -586,7 +683,7 @@ class FeatureEngineer:
             pid = r[patient_col]
             os_map[pid] = {
                 "os_days": r[os_months_col] * 30.44 if pd.notna(r[os_months_col]) else np.nan,
-                "dead": 1 if str(r.get(os_status_col, "")).startswith("1") or "DECEASED" in str(r.get(os_status_col, "")).upper() else 0,
+                "dead": 1 if parse_event_status(r.get(os_status_col, np.nan)) == 1 else 0,
             }
 
         for pid, grp in lines.groupby(patient_col):
@@ -652,7 +749,8 @@ class FeatureEngineer:
             Free-text agent names (e.g. 'Pembrolizumab').
         categories_dict : dict
             Mapping of category label to list of agent name patterns
-            (case-insensitive substring matching).  Example::
+            (case-insensitive substring matching).  The dict order is the
+            label order for combination regimens.  Example::
 
                 {'ICI': ['pembrolizumab', 'nivolumab', 'atezolizumab'],
                  'Platinum': ['carboplatin', 'cisplatin']}
@@ -663,15 +761,24 @@ class FeatureEngineer:
         Returns
         -------
         Series
-            Categorical labels aligned with *agent_names*.
+            Categorical labels aligned with *agent_names*.  A name matching
+            patterns from several categories (e.g. a multi-agent regimen
+            ``'CARBOPLATIN+PEMBROLIZUMAB'``) receives an explicit combined
+            label joining the matched categories with ``' + '`` in
+            *categories_dict* order (e.g. ``'ICI + Platinum'``); it is never
+            silently assigned to only one of them.
         """
-        result = pd.Series(default, index=agent_names.index, dtype=object)
+        lowered = agent_names.astype("string").str.lower()
+        matched: List[List[str]] = [[] for _ in range(len(agent_names))]
 
         for category, patterns in categories_dict.items():
+            mask = np.zeros(len(agent_names), dtype=bool)
             for pattern in patterns:
-                mask = agent_names.str.lower().str.contains(
-                    pattern.lower(), na=False
-                )
-                result[mask] = category
+                mask |= lowered.str.contains(
+                    pattern.lower(), regex=False, na=False
+                ).to_numpy(dtype=bool)
+            for pos in np.flatnonzero(mask):
+                matched[pos].append(category)
 
-        return result
+        labels = [" + ".join(cats) if cats else default for cats in matched]
+        return pd.Series(labels, index=agent_names.index, dtype=object)

@@ -60,6 +60,14 @@ def _apply_correction_fallback(
     return result
 
 
+def _is_continuous(series: pd.Series) -> bool:
+    """True for a numeric (non-bool) series whose values are not all in {0, 1}."""
+    if series.dtype == bool or not pd.api.types.is_numeric_dtype(series):
+        return False
+    vals = pd.unique(series.dropna())
+    return not set(np.asarray(vals, dtype=float).tolist()).issubset({0.0, 1.0})
+
+
 class BiomarkerScreen:
     """High-throughput biomarker screening with multiple-testing correction.
 
@@ -78,7 +86,8 @@ class BiomarkerScreen:
     alpha : float, default 0.05
         Significance threshold after correction.
     min_exposed : int, default 20
-        Minimum number of patients with biomarker == 1 to attempt fitting.
+        Minimum number of patients with biomarker == 1 to attempt fitting
+        (binary biomarkers only; not applied to continuous biomarkers).
     min_events : int, default 5
         Minimum events in the exposed group.
     penalizer : float, default 0.01
@@ -119,7 +128,7 @@ class BiomarkerScreen:
         df: pd.DataFrame,
         biomarker_cols: Sequence[str],
         outcome_col: str,
-        event_col: str,
+        event_col: Optional[str] = None,
         covariates: Optional[Sequence[str]] = None,
     ) -> pd.DataFrame:
         """Screen biomarkers against a single outcome.
@@ -131,9 +140,11 @@ class BiomarkerScreen:
         biomarker_cols : sequence of str
             Columns to test as candidate biomarkers.
         outcome_col : str
-            Duration column (for Cox) or binary outcome (for logistic).
-        event_col : str
-            Event indicator column.
+            Duration column (for Cox) or binary 0/1 outcome (for logistic).
+        event_col : str, optional
+            Event indicator column.  Required for ``'cox'`` /
+            ``'competing_risks'``; ignored for ``'logistic'`` (the binary
+            outcome is *outcome_col*).
         covariates : sequence of str, optional
             Adjustment covariates.
 
@@ -141,10 +152,18 @@ class BiomarkerScreen:
         -------
         DataFrame
             One row per biomarker with columns: ``biomarker``, ``hr``
-            (or ``or`` for logistic), ``ci_lower``, ``ci_upper``, ``p``,
-            ``p_adjusted``, ``significant``, ``n_exposed``,
-            ``n_events_exposed``.
+            (for logistic this holds the odds ratio), ``ci_lower``,
+            ``ci_upper``, ``p``, ``p_adjusted``, ``significant``,
+            ``n_exposed``, ``n_events_exposed``.  Binary (0/1) biomarkers
+            must have at least *min_exposed* carriers; continuous biomarkers
+            are not subject to *min_exposed* and report ``n_exposed`` /
+            ``n_events_exposed`` as NaN (the *min_events* check is then
+            applied to all events).
         """
+        if self.method != "logistic" and event_col is None:
+            raise ValueError(
+                f"event_col is required for method='{self.method}'."
+            )
         results: List[Dict[str, Any]] = []
 
         for col in biomarker_cols:
@@ -257,27 +276,43 @@ class BiomarkerScreen:
             Result dictionary with standard keys.
         """
         covs = list(covariates) if covariates else []
-        all_cols = [outcome_col, event_col, biomarker_col] + covs
+        # For logistic models the binary outcome *is* the event; never use
+        # the same column twice (duplicate columns break the fit).
+        ev_col = outcome_col if (self.method == "logistic" or event_col is None) else event_col
+        all_cols = list(dict.fromkeys([outcome_col, ev_col, biomarker_col] + covs))
         sub = df[all_cols].dropna()
 
         row: Dict[str, Any] = {"biomarker": biomarker_col}
 
-        n_exposed = int((sub[biomarker_col] == 1).sum()) if sub[biomarker_col].dtype in [int, float, np.int64, np.float64, bool] else int(sub[biomarker_col].astype(bool).sum())
-        n_events_exposed = int(sub.loc[sub[biomarker_col] == 1, event_col].sum()) if n_exposed > 0 else 0
-        row["n_exposed"] = n_exposed
-        row["n_events_exposed"] = n_events_exposed
+        if _is_continuous(sub[biomarker_col]):
+            # Continuous biomarker: "exposed" is undefined -> min_exposed
+            # does not apply; require min_events over all observations.
+            row["n_exposed"] = np.nan
+            row["n_events_exposed"] = np.nan
+            too_small = (
+                len(sub) == 0
+                or float(pd.to_numeric(sub[ev_col], errors="coerce").sum()) < self.min_events
+            )
+        else:
+            exposed = sub[biomarker_col].astype(bool) if sub[biomarker_col].dtype == object else (sub[biomarker_col] == 1)
+            n_exposed = int(exposed.sum())
+            n_events_exposed = int(sub.loc[exposed, ev_col].sum()) if n_exposed > 0 else 0
+            row["n_exposed"] = n_exposed
+            row["n_events_exposed"] = n_events_exposed
+            too_small = n_exposed < self.min_exposed or n_events_exposed < self.min_events
 
-        if n_exposed < self.min_exposed or n_events_exposed < self.min_events:
+        if too_small:
             row.update(hr=np.nan, ci_lower=np.nan, ci_upper=np.nan, p=np.nan)
             return row
 
         if self.method == "cox":
-            row.update(self._fit_cox(sub, biomarker_col, outcome_col, event_col, covs))
+            row.update(self._fit_cox(sub, biomarker_col, outcome_col, ev_col, covs))
         elif self.method == "logistic":
-            row.update(self._fit_logistic(sub, biomarker_col, event_col, covs))
+            # Binary outcome is outcome_col (per the screen() docstring)
+            row.update(self._fit_logistic(sub, biomarker_col, outcome_col, covs))
         else:
             # Competing risks handled via screen_competing_risks
-            row.update(self._fit_cox(sub, biomarker_col, outcome_col, event_col, covs))
+            row.update(self._fit_cox(sub, biomarker_col, outcome_col, ev_col, covs))
 
         return row
 
