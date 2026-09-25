@@ -21,13 +21,14 @@
 ## Key Results
 - Discovery: [N] FDR-significant out of [N] tested
 - Confirmation: [N] both-significant
+- Predictive vs prognostic: [N] predictive / [N] prognostic / [N] not evaluable
 - Robustness: [N] robust / [N] exploratory / [N] unstable
 - Delta-C: +[X] at [Y] months
 - External validation: [metric] = [value]
 
 ## Pitfalls Encountered
 <!-- Document any pitfalls detected during analysis -->
-<!-- Format: Pitfall #N: description, how detected, how fixed -->
+<!-- Format: Pitfall #N (1-11, see cascade/pitfalls/library.py): description, how detected, how fixed -->
 
 ## Environment
 - Python version: [FILL]

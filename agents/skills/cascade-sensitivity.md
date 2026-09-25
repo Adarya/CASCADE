@@ -28,9 +28,11 @@ Stress-test biomarker findings across 7 categories of variation and classify eac
    - Effect size similarity
    - Significance preservation
 4. **Classifies robustness**:
-   - **ROBUST**: Concordance >= 75% AND zero direction flips
-   - **EXPLORATORY**: Default (not robust, not unstable)
-   - **UNSTABLE**: ANY direction flip in HR or OR across variants
+   - **ROBUST**: zero direction flips, at least `min_evaluable` (default 2) evaluable variants, AND concordance >= 75%. Concordance counts failed variants in the denominator
+   - **EXPLORATORY**: otherwise (primary effect missing, too few evaluable variants, too many failed variants)
+   - **UNSTABLE**: ANY direction flip in HR or OR across evaluable variants
+
+   Variants that fail to run (`suite.failed_variants`) or give no estimate for a finding count as failed and are never dropped. The Layer 4 gate fails if the table is empty or no variant was evaluable for any finding.
 
 ## Expected Output
 - CSV: `cascade_sensitivity_results.csv` with variant x finding results
@@ -56,19 +58,32 @@ Any figures produced (e.g., robustness bar charts, HR comparison forests) MUST f
 ## Example Code
 
 ```python
-from cascade.core import SensitivitySuite
+from cascade.core import BiomarkerScreen, SensitivitySuite
+
+genes = ["GENE_A", "GENE_B", "GENE_C"]
+screen = BiomarkerScreen(method="cox")
+
+def run_cox_screen(d):
+    return screen.screen(d, genes, "OS_MONTHS", "OS_STATUS", covariates=["AGE", "SEX"])
+
+primary_results = run_cox_screen(df)
 
 suite = SensitivitySuite()
 
-# Add variants from different categories
+# Add variants from different categories (DataFrames or filter callables)
 suite.add_variant(">=6mo followup", df[df.followup >= 6], "threshold")
 suite.add_variant(">=12mo followup", df[df.followup >= 12], "threshold")
 suite.add_variant("Adeno only", df[df.histology == "Adeno"], "subgroup")
 suite.add_variant("Squamous only", df[df.histology == "Squamous"], "subgroup")
-suite.add_variant("1L only", df[df.line == 1], "stratification")
-suite.add_variant("Penalizer 0.1", df, "statistical")  # pass to analysis_fn
+suite.add_variant("1L only", lambda d: d[d.line == 1], "stratification")
 
-sensitivity_results = suite.run(analysis_fn=run_cox_screen, df=df)
-robustness = suite.classify_robustness(primary_results, sensitivity_results)
+# Callable variants are applied to primary_df; **kwargs go to every analysis_fn call,
+# so a statistical variant (e.g. another penalizer) needs its own analysis function.
+sensitivity_results = suite.run(run_cox_screen, primary_df=df)
+robustness = suite.classify_robustness(
+    primary_results, sensitivity_results,
+    failed_variants=list(suite.failed_variants),
+)
+print(robustness[["biomarker", "robustness_class", "n_evaluable", "concordance"]])
 print(robustness["robustness_class"].value_counts())
 ```

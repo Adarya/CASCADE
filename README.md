@@ -24,21 +24,24 @@ CASCADE formalizes a nine-layer validation methodology (Layers 0–8) that emerg
 
 ### The Pitfall Library
 
-11 catalogued failure modes. Eight automated checks provide detection for
-seven of them (#1–#4, #7, #10 and #11); the remainder are runtime, manual, or
-partial:
+11 catalogued failure modes (`cascade/pitfalls/library.py`). Seven are fully
+automated (#1–#4, #7, #10, #11), implemented by eight check functions in
+`cascade/pitfalls/checks/` (#7 has two: singular-matrix and separation);
+#5 is caught at runtime, #6 is manual, and #8 and #9 are partially automated.
+`PitfallRegistry().list_automatable(include_partial=False)` returns the seven
+fully automated pitfalls (`include_partial=True`, the default, adds #8 and #9).
 
-1. Comment header corruption (`#hex` in STYLE_COLOR columns) — *automated*
-2. Covariate leakage in landmark models (future treatment data) — *automated*
-3. Perfect collinearity (algebraic identities) — *automated*
-4. Constant variable at short landmarks — *automated*
+1. Comment header corruption (`#hex` in STYLE_COLOR) — *automated*
+2. Covariate leakage in landmark models — *automated*
+3. Perfect collinearity (algebraic identity) — *automated*
+4. Constant variable at short landmark — *automated*
 5. XGBoost softprob failure for 2-class subgroups — *runtime*
-6. Platform-specific R package compile failure (Fortran linker, macOS ARM) — *manual*
-7. Singular matrix from constant covariates in subgroups — *automated*
-8. Fabricated citations by AI agents — *partial* (format/plausibility screen only)
-9. Performance status floor effects (baseline confounding) — *partial*
+6. R classifier package macOS ARM Fortran linker failure — *manual*
+7. Singular matrix from constant covariate in subgroup — *automated* (separation / extreme CIs are reported under #7 with their own label)
+8. Fabricated citation by AI agent — *partial* (format/plausibility screen only)
+9. Performance status floor effect (ECOG paradox) — *partial*
 10. Informative (biomarker-dependent) censoring — *automated* (v0.4.0)
-11. Centre or batch effects in multi-institutional cohorts — *automated* (v0.4.0)
+11. Centre or batch effect in multi-institutional cohorts — *automated* (v0.4.0)
 
 ## Installation
 
@@ -75,6 +78,8 @@ pipeline.add_layer("confirmation", OrthogonalConfirm(confirm_method="logistic"))
 
 # A sensitivity analysis is only meaningful once you declare what to vary.
 # The pipeline re-runs the discovery screen under each variant automatically.
+# A finding is only classified ROBUST with >= 2 evaluable variants
+# (min_evaluable), so a single variant yields EXPLORATORY at best.
 sensitivity = SensitivitySuite()
 sensitivity.add_variant("complete_cases", lambda d: d.dropna(), category="threshold")
 pipeline.add_layer("sensitivity", sensitivity)
@@ -84,6 +89,10 @@ pipeline.add_layer("artifact_guard", ArtifactGuard())
 # Inter-layer dependencies (discovery -> confirmation -> sensitivity) are wired
 # automatically -- no need to declare depends_on. Pass strict=True to raise on
 # any layer failure; otherwise failures are reported loudly, never swallowed.
+# Decision gates are evaluated by default (GateEvaluator('general')); pass
+# Pipeline(gate_evaluator=GateEvaluator(study_type=...)) to change the study
+# type or Pipeline(gate_evaluator=False) to run ungated. Gates fail closed:
+# missing, NaN or empty inputs fail the gate.
 results = pipeline.run(
     data=df,
     biomarker_cols=gene_columns,
@@ -92,7 +101,8 @@ results = pipeline.run(
 )
 
 assert not results.failed_layers, results.failed_layers  # fail loud
-print(pipeline.report())
+print(pipeline.gate_summary())   # PASS / FAIL per gated layer
+print(pipeline.report())         # layer status reflects gate outcomes
 ```
 
 ### Individual Layers
@@ -101,22 +111,57 @@ Each layer is independently usable:
 
 ```python
 # Sensitivity analysis with robustness scoring
-from cascade.core import SensitivitySuite
+from cascade.core import BiomarkerScreen, SensitivitySuite
+
+screen = BiomarkerScreen(method="cox")
+primary_results = screen.screen(df, gene_columns, "OS_MONTHS", "OS_STATUS")
 
 suite = SensitivitySuite()
 suite.add_variant(">=6mo followup", df[df.followup >= 6], category="threshold")
 suite.add_variant("Adeno only", df[df.histology == "Adeno"], category="subgroup")
-robustness = suite.classify_robustness(primary_results, sensitivity_results)
+sensitivity_results = suite.run(
+    lambda d: screen.screen(d, gene_columns, "OS_MONTHS", "OS_STATUS")
+)
+robustness = suite.classify_robustness(
+    primary_results, sensitivity_results,
+    failed_variants=list(suite.failed_variants),  # failed variants count against robustness
+)
+print(robustness[["biomarker", "hr", "robustness_class", "concordance"]])
 ```
 
 ```python
-# Pitfall detection
+# Pitfall detection: each check runs only when its inputs are supplied
 from cascade.pitfalls import PitfallDetector
 
 detector = PitfallDetector()
-detector.check_all(data_file="data.txt", model_df=landmark_df, feature_matrix=X)
+detector.check_all(
+    data_file="data_clinical_patient.txt",           # 1: comment-header corruption
+    feature_matrix=df[gene_columns + ["AGE"]],        # 3, 4, 7: collinearity, constants, singular
+    survival_df=df, duration_col="OS_MONTHS", event_col="OS_STATUS",
+    biomarker_cols=gene_columns,                      # 10: informative censoring
+    center_col="CENTER",                              # 11: centre / batch effect
+)
 for warning in detector.warnings:
-    print(f"[{warning.severity.value}] {warning.message}")
+    print(f"[{warning.severity.value}] #{warning.pitfall.id}: {warning.message}")
+print(detector.summary())
+```
+
+The same checks can run inside Layer 5. Pitfall warnings are added to the
+artifact report and the compliance report. CRITICAL ones block the Layer 5
+gate, and the gate also fails if no check ran:
+
+```python
+from cascade.core import ArtifactGuard
+
+report = ArtifactGuard().run_all(
+    df,
+    biomarker_cols=gene_columns,                      # collinearity / VIF
+    pitfall_inputs=dict(
+        survival_df=df, duration_col="OS_MONTHS", event_col="OS_STATUS",
+        biomarker_cols=gene_columns, center_col="CENTER",
+    ),
+)
+print(report.checks_run, report.critical_findings)
 ```
 
 ```python
@@ -223,6 +268,7 @@ CASCADE includes custom skills for AI-assisted validation:
 | `/cascade-sensitivity` | 4 | 7-category sensitivity suite |
 | `/cascade-guard` | 5 | Automated artifact checks |
 | `/cascade-translate` | 6 | Landmark analysis + delta-C |
+| `/cascade-validate` | 7 | External validation |
 | `/cascade-report` | All | Full compliance report |
 
 ## Requirements
@@ -235,7 +281,7 @@ CASCADE includes custom skills for AI-assisted validation:
 
 If you use CASCADE in your research, please cite:
 
-> CASCADE: A multi-layer validation framework for biomarker discovery in clinical genomics. (Manuscript in preparation, 2026).
+> CASCADE: A multi-layer validation framework for biomarker discovery in clinical genomics. (Manuscript under review, 2026).
 
 ## License
 

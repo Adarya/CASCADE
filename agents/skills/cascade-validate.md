@@ -22,7 +22,7 @@ Validate biomarker findings on an independent cohort from a different institutio
    - Confusion matrix
 4. **Hierarchical evaluation** (optional):
    - Collapse classes to higher-level groups
-   - Group-level accuracy and confusion matrix
+   - Group-level balanced accuracy, kappa, per-group F1 and confusion matrix
 5. **Calibrated consensus** (if multiple approaches):
    - Weighted combination of predictions
    - Confidence tiers (high/moderate/low)
@@ -31,7 +31,7 @@ Validate biomarker findings on an independent cohort from a different institutio
 - Classification report with per-class metrics
 - Confusion matrix
 - Balanced accuracy and Cohen's kappa
-- Hierarchical group accuracy (if applicable)
+- Hierarchical group balanced accuracy (if applicable)
 
 ## Figure Guidelines
 
@@ -72,5 +72,7 @@ print(f"Cohen's kappa: {metrics['kappa']:.3f}")
 # Hierarchical evaluation
 group_map = {"SubtypeA": "ER+", "SubtypeB": "ER+", "SubtypeC": "HER2+", "SubtypeD": "ER-/HER2-"}
 group_metrics = validator.hierarchical_evaluate(y_test_external, y_pred, group_map)
-print(f"Group accuracy: {group_metrics['group_accuracy']:.1%}")
+print(f"Group balanced accuracy: {group_metrics['group_balanced_accuracy']:.1%}")
+print(f"Group kappa: {group_metrics['group_kappa']:.3f}")
+print(f"Unmapped labels: {group_metrics['unmapped_true']}")
 ```

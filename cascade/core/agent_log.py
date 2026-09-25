@@ -283,7 +283,7 @@ class AgentDecisionLog:
         ----------
         study : str
         pitfall_id : int
-            Pitfall registry ID (1-9).
+            Pitfall registry ID (1-11).
         description : str
             What was prevented.
         automated : bool, default True

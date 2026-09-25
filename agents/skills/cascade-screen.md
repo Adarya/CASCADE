@@ -13,7 +13,7 @@ Run a systematic biomarker discovery screen with proper multiple testing correct
 
 ## What It Does
 
-1. **Loads data** and validates required columns exist
+1. **Loads data** and validates required columns exist. Event columns may be 0/1, booleans or cBioPortal status strings (`'1:DECEASED'` / `'0:LIVING'`). Non-numeric covariates (e.g. `SEX='Male'/'Female'`) are dummy-encoded
 2. **Enumerates** all biomarker x outcome combinations
 3. **Fits models** for each combination:
    - Cox PH for prognostic questions
@@ -21,12 +21,12 @@ Run a systematic biomarker discovery screen with proper multiple testing correct
    - Cause-specific Cox for tropism (site-specific metastasis)
 4. **Filters** results:
    - Removes separation problems (CI ratio > 100)
-   - Removes underpowered tests (< 20 exposed, < 5 events)
+   - Removes underpowered tests (< 20 exposed, < 5 events); the cause-specific (tropism) screen skips gene-site pairs with fewer than `min_events` events in either the exposed or unexposed arm
 5. **Applies FDR correction** (Benjamini-Hochberg, alpha=0.05)
 6. **Generates** results table sorted by adjusted p-value
 
 ## Expected Output
-- CSV file: `cascade_screen_results.csv` with columns: biomarker, hr/or, ci_lower, ci_upper, p, p_adjusted, significant, n_exposed, n_events
+- CSV file: `cascade_screen_results.csv` with columns: biomarker, hr/or, ci_lower, ci_upper, p, p_adjusted, significant, n_exposed, n_events, fit_error (why a model failed to fit, instead of a silent NaN)
 - Summary: N tested, N significant after FDR, top hits
 
 ## Figure Guidelines
@@ -44,6 +44,7 @@ Any figures produced (e.g., volcano plots, heatmaps) MUST follow these standards
 - [ ] No separation problems in final results (CI ratio < 100)
 - [ ] FDR correction applied (check p_adjusted >= p for all rows)
 - [ ] Minimum subgroup sizes met
+- [ ] Rows with a non-empty `fit_error` reviewed and reported
 - [ ] Results saved to file
 
 ## Example Code

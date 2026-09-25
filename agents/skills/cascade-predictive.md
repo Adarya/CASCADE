@@ -20,12 +20,13 @@ Formally test whether a biomarker is predictive (modifies treatment effect) or m
 4. **Classifies**:
    - Interaction P < 0.05 → PREDICTIVE (gene modifies treatment effect)
    - Interaction P >= 0.05 → PROGNOSTIC only (gene associated with outcome regardless)
+   - Interaction not testable → NOT_EVALUABLE, with `result.reason`. This covers a treatment arm smaller than `min_arm_size` (default 10), no variation in the interaction term, or a failed fit. It is never reported as prognostic.
 5. **Optional 3-way extension**: gene x treatment x phenotype
 
 ## Expected Output
 - Interaction HR, P-value, 95% CI
 - Stratified HRs (treated vs untreated)
-- Classification: PREDICTIVE or PROGNOSTIC
+- Classification: PREDICTIVE, PROGNOSTIC or NOT_EVALUABLE (the Layer 3 gate fails if no biomarker is evaluable)
 - Forest plot data for visualization
 
 ## Figure Guidelines
@@ -41,7 +42,7 @@ Any figures produced (e.g., forest plots, stratified KM curves) MUST follow thes
 ## Post-Execution Validation
 - [ ] Interaction term correctly specified (product of binary variables)
 - [ ] Stratified analysis uses SEPARATE patient subsets (not overlapping)
-- [ ] Classification explicitly stated
+- [ ] Classification explicitly stated (NOT_EVALUABLE results reported with their reason)
 - [ ] If predictive: clinical implication noted (e.g., "test before prescribing")
 
 ## Example Code
@@ -57,7 +58,8 @@ test = PredictiveTest(
     covariates=["AGE", "STAGE", "ER_STATUS"],
 )
 result = test.run(df)
-print(f"Classification: {result.classification}")
+print(f"Classification: {result.classification} {result.reason}")
+print(f"Arms: treated={result.n_treated}, untreated={result.n_untreated}")
 print(f"Interaction HR: {result.interaction_hr:.2f} (P={result.interaction_p:.4f})")
 print(f"HR in treated: {result.hr_treated:.2f}")
 print(f"HR in untreated: {result.hr_untreated:.2f}")

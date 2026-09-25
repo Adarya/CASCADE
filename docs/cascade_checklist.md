@@ -38,7 +38,7 @@ For each item, mark [x] if completed, [ ] if not applicable, or add notes. Inclu
 
 - [ ] **3.1** Gene x treatment interaction formally tested
 - [ ] **3.2** Stratified effects reported (HR with treatment: ___; HR without: ___)
-- [ ] **3.3** Classification stated: PREDICTIVE / PROGNOSTIC
+- [ ] **3.3** Classification stated: PREDICTIVE / PROGNOSTIC / NOT_EVALUABLE (reason: ___)
 - [ ] **3.4** If predictive: interaction HR = ___, P = ___
 
 ## Layer 4: Sensitivity & Robustness Testing
@@ -120,6 +120,8 @@ Were any of the following pitfalls relevant to this study?
 - [ ] P7: Singular matrix from constant covariate in subgroup
 - [ ] P8: Fabricated citation by AI agent
 - [ ] P9: Performance status floor effect (baseline confounding)
+- [ ] P10: Informative (biomarker-dependent) censoring (differential follow-up by biomarker status)
+- [ ] P11: Centre or batch effect (prevalence or effect heterogeneity across institutions)
 - [ ] Other: _______________
 
 If yes, document how each was detected and resolved.

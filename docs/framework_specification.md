@@ -31,7 +31,7 @@ Layer 1: Biomarker Discovery Screen
     v [GATE: >= 1 FDR-significant finding]
 Layer 2: Orthogonal Confirmation
     |
-    v [GATE: Direction concordance > 70%]
+    v [GATE: Direction concordance >= 70%]
 Layer 3: Predictive vs Prognostic Distinction
     |
     v [GATE: Classification assigned]
@@ -52,7 +52,7 @@ Layer 8: Manuscript & Communication
 
 **Independence principle.** Each layer is independently usable. A study can apply Layer 1 alone (discovery with FDR correction), Layers 1 + 4 (discovery plus sensitivity), or any other subset. However, maximum validation strength comes from the full cascade.
 
-**Composability.** Layers can be chained via the `Pipeline` orchestrator, which passes results between layers, tracks completion status, and generates compliance reports. Each layer exposes a consistent interface: it accepts data and prior-layer results, and returns structured outputs with warnings.
+**Composability.** Layers can be chained via the `Pipeline` orchestrator, which passes results between layers, tracks completion status, evaluates decision gates (on by default; `Pipeline(gate_evaluator=False)` opts out), and generates compliance reports. Each layer exposes a consistent interface: it accepts data and prior-layer results, and returns structured outputs with warnings.
 
 **Each layer has four components:**
 
@@ -75,13 +75,17 @@ Layer 8: Manuscript & Communication
 
 **Key Operations.**
 
-1. **Data loading with comment header handling.** Clinical data files contain metadata rows starting with `#`. Naive use of `comment='#'` in pandas corrupts files that contain hex color codes (e.g., `STYLE_COLOR = '#359645'`). Safe loading requires detecting whether `#` appears in data values and, if so, manually stripping comment lines before parsing:
+1. **Data loading with comment header handling.** Clinical data files contain metadata rows starting with `#`. Naive use of `comment='#'` in pandas corrupts files that contain hex color codes (e.g., `STYLE_COLOR = '#359645'`), because every row is truncated at the first `#`. Safe loading skips only the leading block of `#` metadata lines and never passes `comment=` to pandas, so `#` inside data fields is preserved. This is the default behaviour of `CohortBuilder.load_tsv`:
 
 ```python
-# Safe loading pattern (from CohortBuilder.load_tsv)
+# Safe loading pattern (CohortBuilder.load_tsv default)
 with open(filepath, 'r') as fh:
-    lines = [line for line in fh if not line.startswith('#')]
-df = pd.read_csv(io.StringIO(''.join(lines)), sep='\t')
+    n_header = 0
+    for line in fh:
+        if not line.startswith('#'):
+            break
+        n_header += 1
+df = pd.read_csv(filepath, sep='\t', skiprows=n_header)
 ```
 
 2. **Stage filtering.** Restrict to the clinically relevant population (e.g., Stage IV for metastatic analyses) using the `STAGE_CDM_DERIVED` field in the diagnosis timeline.
@@ -89,9 +93,10 @@ df = pd.read_csv(io.StringIO(''.join(lines)), sep='\t')
 3. **Mutation matrix construction.** Build a patient-by-gene binary matrix from MAF-format mutation data. Filter to OncoKB "Oncogenic" or "Likely Oncogenic" variants. Deduplicate to one entry per patient-gene pair. Output is a binary (0/1) matrix indexed by `PATIENT_ID`.
 
 4. **Treatment line detection.** Identify treatment lines from the longitudinal treatment timeline using a gap-based algorithm:
-   - Sort events by `PATIENT_ID` and `START_DATE`
-   - A gap of >90 days between `STOP_DATE` and the next `START_DATE` indicates a new treatment line
-   - Agents starting within a 28-day concurrent window are grouped into the same regimen
+   - Sort events by `PATIENT_ID` and `START_DATE`; the first record opens line 1
+   - Agents starting within a 28-day concurrent window of the current line start are grouped into the same regimen
+   - Otherwise, a gap of >90 days between the latest prior activity (the maximum earlier `STOP_DATE`, or `START_DATE` when the stop is missing) and the next `START_DATE` starts a new line
+   - Within the gap limit, a record for an agent already in the current line continues that line; a new agent added outside the concurrent window starts a new line (switch or escalation)
    - Assign `LINE_NUMBER`, `LINE_START`, and `LINE_AGENTS` (comma-separated) to each record
 
 5. **Time-dependent feature engineering.** Clinical phenotypes must be determined at the time of treatment start, not at sample collection or study end. Two core patterns:
@@ -146,7 +151,7 @@ df = pd.read_csv(io.StringIO(''.join(lines)), sep='\t')
 
 5. **Enumeration pattern.** For tropism screening, iterate over all (gene, site) combinations. For interaction screening, iterate over all (gene, treatment, phenotype) triplets. Track convergence status and exclude non-converged models.
 
-**Outputs.** DataFrame with one row per tested hypothesis: gene, site/treatment/phenotype, n, n_events, n_exposed, coef, HR, SE, z, p, CI_lower, CI_upper, FDR-adjusted p, significance flag, convergence flag.
+**Outputs.** DataFrame with one row per tested hypothesis: gene, site/treatment/phenotype, n, n_events, n_exposed, coef, HR, SE, z, p, CI_lower, CI_upper, FDR-adjusted p, significance flag, convergence flag, and `fit_error` (the reason a model failed to fit, instead of a silent NaN). Event columns may be 0/1, booleans or cBioPortal status strings (`'1:DECEASED'`); non-numeric covariates are dummy-encoded.
 
 **Decision Gate.** At least one FDR-significant finding (adjusted p < 0.05) to proceed to Layer 2. If zero findings survive FDR, the analysis stops or is reframed (e.g., broader phenotype definitions, different endpoint).
 
@@ -175,7 +180,7 @@ df = pd.read_csv(io.StringIO(''.join(lines)), sep='\t')
 
 **Outputs.** Confirmation results DataFrame, cross-analysis concordance statistics (rho, p, direction agreement %), list of both-significant findings, confidence tier assignments (both-significant, discovery-only, confirmation-only).
 
-**Decision Gate.** Direction concordance > 70% across all tested hypotheses AND at least one both-significant finding. If concordance is below 70%, the Layer 1 findings may be model-dependent and require investigation.
+**Decision Gate.** Direction concordance >= 70% across all tested hypotheses AND at least one both-significant finding. The gate fails if concordance cannot be computed. If concordance is below 70%, the Layer 1 findings may be model-dependent and require investigation.
 
 ---
 
@@ -200,7 +205,8 @@ The interaction coefficient `beta_int` tests whether the gene effect differs bet
 
 3. **Classification assignment:**
    - **PREDICTIVE**: `beta_int` p-value < 0.05 (the gene effect significantly differs by treatment)
-   - **PROGNOSTIC only**: `beta_int` p-value >= 0.05 (the gene effect does not depend on treatment)
+   - **PROGNOSTIC only**: `beta_int` estimated with p-value >= 0.05 (the gene effect does not depend on treatment)
+   - **NOT_EVALUABLE**: the interaction could not be tested, because a treatment arm has fewer than `min_arm_size` patients (default 10), the interaction term has no variation, or the model failed to fit. The reason is recorded. A test that could not be run is never reported as prognostic.
 
 4. **Three-way extension.** For studies incorporating clinical phenotypes, extend to a three-way interaction model:
 
@@ -213,9 +219,9 @@ h(t) = h0(t) * exp(b1*Gene + b2*Treatment + b3*Phenotype
 
 The coefficient `b7` tests whether the gene-treatment relationship is modified by the clinical phenotype.
 
-**Outputs.** For each biomarker: classification (PREDICTIVE or PROGNOSTIC), interaction HR with CI and p-value, stratified HRs (treated vs untreated), and model fit statistics (concordance, AIC).
+**Outputs.** For each biomarker: classification (PREDICTIVE, PROGNOSTIC or NOT_EVALUABLE), interaction HR with CI and p-value, stratified HRs (treated vs untreated), and model fit statistics (concordance, AIC).
 
-**Decision Gate.** Every significant biomarker from Layer 2 must receive an explicit classification. Report the classification alongside all downstream results. Predictive findings have higher priority for clinical translation (Layer 6).
+**Decision Gate.** Every significant biomarker from Layer 2 must receive an explicit classification. The gate fails if the classification table is empty or if no biomarker was evaluable (all NOT_EVALUABLE). Report the classification alongside all downstream results. Predictive findings have higher priority for clinical translation (Layer 6).
 
 ---
 
@@ -245,13 +251,15 @@ The coefficient `b7` tests whether the gene-treatment relationship is modified b
 
 | Tier | Criteria | Interpretation |
 |------|----------|---------------|
-| **ROBUST** | Concordance >= 75% across variants AND zero direction flips | High confidence; report as primary finding |
-| **EXPLORATORY** | Default classification if neither robust nor unstable | Report with appropriate caveats |
-| **UNSTABLE** | ANY direction flip across sensitivity variants | Flag prominently; consider removing from primary results |
+| **ROBUST** | Zero direction flips, at least `min_evaluable` (default 2) evaluable variants, AND concordance >= 75% | High confidence; report as primary finding |
+| **EXPLORATORY** | Otherwise: primary effect missing, too few evaluable variants, or too many failed variants | Report with appropriate caveats |
+| **UNSTABLE** | ANY direction flip across evaluable sensitivity variants | Flag prominently; consider removing from primary results |
+
+A variant is *evaluable* for a finding if it produced an effect estimate for that finding. Concordance is the fraction of **all** variants, failed ones included, that reproduce the primary direction, so a variant that failed to run or produced no estimate lowers concordance and is never silently dropped.
 
 **Outputs.** Sensitivity results matrix (findings x variants), concordance percentages, direction-flip flags, robustness tier for each finding.
 
-**Decision Gate.** All primary findings receive a robustness classification. Unstable findings are flagged or removed from the primary results. The manuscript must report the robustness classification for each finding. **Pitfalls guarded: #4 (constant variable at short landmark).**
+**Decision Gate.** All primary findings receive a robustness classification. The gate fails if the table is empty or if no sensitivity variant was evaluable for any finding. Unstable findings are flagged or removed from the primary results. The manuscript must report the robustness classification for each finding. **Pitfalls guarded: #4 (constant variable at short landmark).**
 
 ---
 
@@ -268,10 +276,10 @@ The coefficient `b7` tests whether the gene-treatment relationship is modified b
    - Phi coefficient with Fisher z-transform CI
    - Spearman rank correlation on continuous versions
    - TOST (Two One-Sided Tests) equivalence procedure for formal independence demonstration
-   - Bayes factor for independence (BIC approximation; BF10 < 1 supports independence)
+   - Bayes factor for independence (BIC approximation based on the likelihood-ratio G² statistic; BF10 < 1 supports independence)
    - Discordance rate (percentage of observations where the two features disagree)
 
-2. **Covariate leakage detection.** For each binary covariate in landmark models, verify that the events contributing to the variable all have dates on or before the landmark date. Flag any covariate computed from "ever received" logic that uses full follow-up data. Fix by recomputing from the treatment timeline filtered to `START_DATE <= landmark_date`.
+2. **Covariate leakage detection.** For each binary covariate in landmark models, verify that the events contributing to the variable all have dates on or before the landmark date. The date-based check takes a `{covariate: exposure_date_col}` mapping. Flag any covariate computed from "ever received" logic that uses full follow-up data. Fix by recomputing from the treatment timeline filtered to `START_DATE <= landmark_date`.
 
 3. **Immortal time bias prevention.** Verify that trajectory variables (e.g., acquisition rate, pattern of dissemination) are not computed over the entire follow-up and then used as baseline predictors. Time-varying covariates must use landmark analysis or time-varying Cox formulations.
 
@@ -286,9 +294,11 @@ The coefficient `b7` tests whether the gene-treatment relationship is modified b
 
 7. **Singular matrix detection.** Before fitting subgroup models, check that no covariate is constant within the subgroup (e.g., ER_BINARY in ER-positive-only analysis). Drop constant covariates automatically and log the removal.
 
+8. **Pitfall library.** `ArtifactGuard.run_all(..., pitfall_inputs={...})` runs `PitfallDetector.check_all` inside Layer 5 with the supplied inputs. This covers comment-header corruption, leakage, collinearity, constant variables, singular matrix and separation, informative censoring (#10) and centre effects (#11). Its warnings are added to the artifact report and the compliance report, and CRITICAL ones are blocking.
+
 **Outputs.** Artifact detection report: list of detected artifacts, severity levels, affected findings, and applied fixes. Independence test suite results with all metrics. Collinearity matrix.
 
-**Decision Gate.** No critical artifacts detected, or all detected artifacts are resolved with documented fixes. If a critical artifact cannot be resolved (e.g., the two combined features are highly correlated), the analysis must be reframed. **Pitfalls guarded: #2 (covariate leakage), #3 (perfect collinearity), #7 (singular matrix from constant covariate), #9 (performance status floor effect).**
+**Decision Gate.** No critical artifacts detected, or all detected artifacts are resolved with documented fixes. The gate fails closed: it fails if no artifact check actually ran (an inconclusive independence test does not count as run), and any CRITICAL finding blocks it. CRITICAL findings include an independence violation, covariate leakage, collinearity or VIF above threshold, and CRITICAL pitfall-library warnings. If a critical artifact cannot be resolved (e.g., the two combined features are highly correlated), the analysis must be reframed. **Pitfalls guarded: #2 (covariate leakage), #3 (perfect collinearity), #7 (singular matrix from constant covariate), #9 (performance status floor effect), #10 (informative censoring), #11 (centre effect).**
 
 ---
 
@@ -310,8 +320,8 @@ delta-C = C_full - C_base
 
 Critically, this must be computed via **cross-validation** (stratified k-fold, typically 10-fold), not on the training set. Training-set C inflates by approximately 0.005-0.01 relative to honest, held-out estimates.
 
-```python
-# Pattern: stratified k-fold CV for delta-C
+```text
+# Pattern (pseudocode): stratified k-fold CV for delta-C
 for train_idx, test_idx in StratifiedKFold(n_splits=10).split(data, events):
     fit base model on train, score on test -> C_base
     fit full model on train, score on test -> C_full
@@ -319,7 +329,7 @@ for train_idx, test_idx in StratifiedKFold(n_splits=10).split(data, events):
 delta_C = mean(fold_deltas)
 ```
 
-3. **Bootstrap significance testing.** Resample the dataset 1,000 times with replacement. For each resample, compute delta-C. Report the 95% bootstrap CI and the approximate p-value (proportion of bootstrap deltas <= 0).
+3. **Bootstrap confidence interval.** Resample the dataset 1,000 times with replacement. For each resample, compute delta-C and report the 95% bootstrap CI. The bootstrap is descriptive only: `bootstrap_delta_c` returns a NaN p-value, and inference uses the cross-validated `cv_delta_c` (stratified folds), which is what `DeltaC.compute` uses.
 
 4. **Likelihood ratio test.** Compare nested models (base vs full) using the log-likelihood ratio statistic. This provides a parametric test of whether the biomarker significantly improves model fit.
 
@@ -327,7 +337,7 @@ delta_C = mean(fold_deltas)
 
 **Outputs.** Delta-C at each landmark with CV and bootstrap CIs. LRT p-value. Risk group KM curves with median survival and log-rank statistics.
 
-**Decision Gate.** Cross-validated delta-C > 0 with bootstrap 95% CI excluding zero at the primary landmark timepoint. If delta-C <= 0 or CI includes zero, the biomarker does not add clinically meaningful predictive value beyond standard covariates.
+**Decision Gate.** Cross-validated delta-C > 0 with 95% CI excluding zero at the primary landmark timepoint. The gate fails closed if delta-C or either CI bound is missing or non-finite. If delta-C <= 0 or CI includes zero, the biomarker does not add clinically meaningful predictive value beyond standard covariates.
 
 ---
 
@@ -361,7 +371,7 @@ Assign confidence tiers (High, Moderate, Low) based on the maximum consensus pro
 
 **Outputs.** Validation performance metrics (balanced accuracy, kappa, per-class F1). Confusion matrix. Concordance metrics for survival models. Treatment-response analysis results. Confidence tier distribution.
 
-**Decision Gate.** Performance above random baseline. For k-class classification, balanced accuracy must exceed 1/k. For survival prediction, concordance must exceed 0.5. For biomarker-treatment interactions, the interaction must be at least nominally significant (p < 0.05) or directionally consistent.
+**Decision Gate.** Performance above random baseline. For k-class classification, balanced accuracy must exceed 1/k (a missing balanced accuracy fails the gate). For survival prediction, concordance must exceed 0.5. For biomarker-treatment interactions, the interaction must be at least nominally significant (p < 0.05) or directionally consistent.
 
 ---
 
@@ -429,6 +439,10 @@ CASCADE maintains a structured catalog of empirically discovered analytical pitf
 
 **Pitfall #9: Performance status floor effect.** Patients with worsened ECOG but stable burden appear paradoxically favorable in unadjusted analyses due to baseline confounding (ECOG-only patients start with ECOG = 0, the best possible score). *Detection*: Compare unadjusted and baseline-adjusted HRs; if the direction flips, a floor effect is present. *Fix*: Include baseline ECOG as a covariate; report both adjusted and unadjusted estimates.
 
+**Pitfall #10: Informative (biomarker-dependent) censoring.** Cox models assume censoring is unrelated to the outcome given the covariates. In observational genomic cohorts, carriers and non-carriers can differ in follow-up (later panel adoption, referral patterns, loss to follow-up), so the censoring process depends on the biomarker and the HR can be biased. *Detection*: Per biomarker, fit a reverse-censoring Cox model with censoring as the event. Flag biomarkers whose censoring HR is significant after Bonferroni adjustment and at least 1.25-fold in either direction. Biomarkers whose model cannot be fitted get an INFO warning. *Fix*: Compare follow-up by biomarker status, adjust for the driver of differential follow-up (sequencing date, institution), and report an inverse-probability-of-censoring-weighted sensitivity analysis. Implemented in `checks/informative_censoring.py`.
+
+**Pitfall #11: Centre or batch effect.** In multi-institutional data, biomarker prevalence can differ across centres (panel coverage, referral mix), which confounds the association. The biomarker effect itself can also differ across centres. *Detection*: Per biomarker, run a chi-square test and compute the absolute range of prevalence across centres (flagged when significant and range >= 0.15). Also run a likelihood-ratio test of a biomarker-by-centre interaction in a centre-stratified Cox model. Both tests use Bonferroni adjustment across biomarkers, and centres with fewer than 20 patients are excluded. *Fix*: Stratify or adjust by centre, verify panel coverage per centre, and report leave-one-centre-out and centre-specific estimates. Source: GENIE BPC external validation (four institutions). Implemented in `checks/center_effect.py`.
+
 ### Adding New Pitfalls
 
 The pitfall library is extensible. To add a new pitfall to the community registry:
@@ -462,7 +476,7 @@ START
   v
 [Layer 2] Orthogonal Confirmation
   |
-  +--> GATE: Direction concordance > 70%?
+  +--> GATE: Direction concordance >= 70%?
   |      NO  --> Investigate model-specific artifacts, try third method
   |      YES --> proceed
   v
@@ -506,7 +520,9 @@ START
 SUBMISSION-READY
 ```
 
-**Gate failures are not fatal.** A failed gate does not necessarily end the analysis. It triggers a remediation path: fix the underlying issue, document what was done, and re-enter the appropriate layer. The CASCADE compliance report records all gate outcomes, including failures that were remediated.
+**Gate failures are not fatal.** A failed gate does not necessarily end the analysis. It triggers a remediation path: fix the underlying issue, document what was done, and re-enter the appropriate layer. The CASCADE compliance report records all gate outcomes, including failures that were remediated. The agent decision log records the final gate state and the remediation attempts.
+
+**Gates fail closed.** Missing, empty or non-finite inputs never pass a gate. This covers an empty classification or robustness table, a NaN delta-C or CI, a missing balanced accuracy, and a Layer 5 report in which no check ran.
 
 ---
 
@@ -520,7 +536,7 @@ SUBMISSION-READY
 | **Orthogonal confirmation** | Explicit layer (Layer 2) requiring independent statistical method | Not addressed | Not addressed |
 | **Predictive vs prognostic** | Formal interaction test with classification (Layer 3) | Recommends distinction but no protocol | Not applicable (focused on prediction models) |
 | **Sensitivity framework** | 7-category systematic framework with 3-tier robustness scoring (Layer 4) | Recommends sensitivity analyses | Recommends internal validation |
-| **Artifact detection** | Automated pitfall library with 9 documented failure modes (Layer 5) | Not addressed | Not addressed |
+| **Artifact detection** | Pitfall library with 11 documented failure modes, 7 fully automated (Layer 5) | Not addressed | Not addressed |
 | **Multiple testing** | FDR/Bonferroni built into Layer 1 with separation problem filtering | Recommends addressing but no protocol | Not directly applicable |
 | **Clinical translation** | Cross-validated delta-C, landmark analysis, risk groups (Layer 6) | Not addressed | Calibration and discrimination recommended |
 | **External validation** | Explicit layer with balanced accuracy, consensus calibration (Layer 7) | Recommends validation | Explicit guidance (TRIPOD Type 4) |
@@ -550,7 +566,7 @@ cascade/
         bootstrap.py       # BootstrapCI, bootstrap_delta_c (Layer 6)
         cross_validate.py  # cv_concordance, cv_delta_c (Layer 6)
     pitfalls/
-        library.py         # Pitfall dataclass and 9-pitfall catalog
+        library.py         # Pitfall dataclass and 11-pitfall catalog
         registry.py        # PitfallRegistry (in-memory pitfall lookup)
         detector.py        # PitfallDetector orchestrator
         checks/
@@ -560,6 +576,8 @@ cascade/
             constant_variable.py # Pitfall #4 detection
             singular_matrix.py   # Pitfall #7 detection
             separation.py        # quasi-separation (relates to #7)
+            informative_censoring.py # Pitfall #10 detection
+            center_effect.py     # Pitfall #11 detection
     core/
         base.py            # Layer protocol + BaseLayer (custom layers)
     pipeline.py            # Pipeline orchestrator (all layers)
@@ -578,6 +596,7 @@ CASCADE includes custom Claude Code skills for AI-assisted validation:
 | `/cascade-sensitivity` | 4 | Run 7-category sensitivity suite |
 | `/cascade-guard` | 5 | Execute automated artifact checks |
 | `/cascade-translate` | 6 | Perform landmark analysis and compute delta-C |
+| `/cascade-validate` | 7 | Evaluate on an independent external cohort |
 | `/cascade-report` | All | Generate full CASCADE compliance report |
 
 ### Validation Tiers

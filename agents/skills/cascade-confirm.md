@@ -4,9 +4,10 @@
 Confirm discovery screen findings using an independent statistical method, compute cross-analysis concordance, and classify findings into confidence tiers.
 
 ## Required Inputs
-- **Primary results**: Output from `/cascade-screen` (CSV with biomarker, hr, p_adjusted, significant)
+- **Primary results**: Output from `/cascade-screen`: either `BiomarkerScreen.screen` output (`biomarker` column) or `screen_competing_risks` output (`gene` + `site` columns), with `hr`, `p_adjusted`, `significant`
 - **Data file path**: Same dataset used for discovery
 - **Confirmatory method**: Independent method (e.g., if primary was `competing_risks`, use `logistic`)
+- **Outcome column**: Binary outcome for `logistic` (no `event_col` needed); for gene-site results each site column of the data is used as the outcome for its pairs, and `outcome_col` is only the fallback
 - **Covariates** (optional): Same or different adjustment set
 
 ## What It Does
@@ -15,8 +16,7 @@ Confirm discovery screen findings using an independent statistical method, compu
 2. **Re-tests** each significant finding using the confirmatory method
 3. **Computes concordance metrics**:
    - Direction agreement: % where HR>1 matches OR>1
-   - Spearman rho between -log10(P) values
-   - Effect size correlation
+   - Spearman rho between log effect sizes (log HR vs log OR)
 4. **Classifies** findings into confidence tiers:
    - **Both-significant**: FDR-sig in BOTH primary AND confirmatory (highest confidence)
    - **Primary-only**: FDR-sig only in primary analysis
@@ -47,17 +47,28 @@ Any figures produced (e.g., concordance scatterplots, effect size comparisons) M
 ## Example Code
 
 ```python
-from cascade.core import OrthogonalConfirm
+from cascade.core import BiomarkerScreen, OrthogonalConfirm
 
+genes = ["GENE_A", "GENE_B", "GENE_C"]
+sites = ["SITE_LIVER", "SITE_BONE"]
+
+# Layer 1 (tropism): cause-specific Cox per gene-site pair
+screen_results = BiomarkerScreen(method="competing_risks").screen_competing_risks(
+    data, genes, sites, duration_col="OS_MONTHS", event_col="OS_STATUS",
+)
+
+# Layer 2: logistic confirmation, pair-wise (each site column is the outcome)
 confirm = OrthogonalConfirm(primary_method="competing_risks", confirm_method="logistic")
 results = confirm.confirm(
     primary_results=screen_results,
     df=data,
-    biomarker_cols=sig_genes,
-    outcome_col="HAS_SITE",
-    covariates=["AGE", "SEX", "HISTOLOGY"],
+    biomarker_cols=genes,
+    outcome_col="SITE_LIVER",          # fallback for sites that are not columns
+    covariates=["AGE", "SEX"],
 )
-metrics = confirm.concordance_metrics(screen_results, confirm_results)
+metrics = confirm.concordance_metrics(screen_results, results)
 print(f"Direction agreement: {metrics['direction_agreement_pct']:.1f}%")
+print(f"Spearman rho (log effects): {metrics['spearman_rho']:.2f}")
 print(f"Both-significant: {metrics['n_both_significant']}")
+print(results["confidence_tier"].value_counts())
 ```

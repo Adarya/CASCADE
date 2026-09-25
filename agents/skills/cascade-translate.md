@@ -20,10 +20,10 @@ Quantify the clinical utility of validated biomarkers through landmark analysis,
    - Fits base model (clinical only) and full model (clinical + biomarker)
    - Stratified 10-fold CV: train on folds, evaluate on held-out
    - Computes delta-C = C_full - C_base (added discrimination)
-3. **Bootstrap significance**:
-   - 1000 bootstrap resamples for delta-C CI
-   - P-value: proportion of bootstrap delta-C <= 0
-4. **Likelihood ratio test**:
+3. **Uncertainty**:
+   - `DeltaC.compute` uses `cv_delta_c` (stratified folds, seeded) and returns `delta_c`, `ci` (bootstrap over the CV fold deltas), `p_value` (fraction of fold-bootstrap means <= 0), `base_c`, `full_c` and `n_failed_folds`
+   - `cascade.stats.bootstrap_delta_c` (whole-cohort resampling) is descriptive only. Its p-value is NaN, so use `cv_delta_c` / `DeltaC` for inference
+4. **Likelihood ratio test** (not part of `DeltaC`; compute separately):
    - Nested model comparison (base vs full)
    - Chi-square test with df = number of added variables
 5. **Risk group construction**:
@@ -32,7 +32,7 @@ Quantify the clinical utility of validated biomarkers through landmark analysis,
    - Pairwise log-rank tests with Holm correction
 
 ## Expected Output
-- Delta-C at each landmark with 95% CI and P-value
+- Delta-C at each landmark with 95% CI and P-value (the Layer 6 gate fails if delta-C or the CI is missing or non-finite)
 - LRT chi-square statistic and P-value
 - KM curves by risk group
 - Median survival per group
@@ -74,7 +74,7 @@ result = dc.compute(
     event_col="OS_STATUS",
 )
 print(f"Delta-C: +{result['delta_c']:.3f} (95% CI: {result['ci'][0]:.3f}-{result['ci'][1]:.3f})")
-print(f"LRT P: {result['p_value']:.2e}")
+print(f"Fold-bootstrap P: {result['p_value']:.3g}; failed folds: {result['n_failed_folds']}")
 
 # Risk groups
 rga = RiskGroupAnalysis(n_groups=3)

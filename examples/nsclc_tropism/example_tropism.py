@@ -221,6 +221,10 @@ print(f"Categories covered: subgroup, stratification")
 # Run sensitivity for significant findings
 scorer = RobustnessScorer()
 sig_findings = merged[merged["significant"]].copy()
+robustness_df = pd.DataFrame(
+    columns=["gene", "site", "primary_hr", "n_evaluable", "robustness_class"]
+)
+counts = pd.Series(dtype=int)
 
 if len(sig_findings) > 0:
     robustness_results = []
@@ -232,30 +236,58 @@ if len(sig_findings) > 0:
         for vname in suite.variant_names:
             vdata = suite._variants[vname]["data"]
             subset = vdata[vdata[site] == 1]
-            if subset[gene].sum() < 3 or len(subset) < 20:
-                continue
-            try:
-                cox = PenalizedCox(penalizer=0.01)
-                cox.fit(subset, "OS_MONTHS", "OS_STATUS", covariates=[gene] + covariates)
-                if cox.converged:
-                    hr = np.exp(cox.summary.loc[gene, "coef"])
-                    variant_hrs.append(hr)
-            except Exception:
-                pass
+            hr = np.nan  # a variant that cannot be estimated counts as failed
+            if subset[gene].sum() >= 3 and len(subset) >= 20:
+                try:
+                    cox = PenalizedCox(penalizer=0.01)
+                    cox.fit(subset, "OS_MONTHS", "OS_STATUS",
+                            covariates=[gene] + covariates)
+                    if cox.converged:
+                        hr = np.exp(cox.summary.loc[gene, "coef"])
+                except Exception:
+                    pass
+            variant_hrs.append(hr)
 
-        classification = scorer.score(primary_hr, variant_hrs)
+        detail = scorer.score_detail(primary_hr, variant_hrs)
         robustness_results.append({
             "gene": gene, "site": site,
             "primary_hr": primary_hr,
-            "n_variants": len(variant_hrs),
-            "robustness": classification,
+            "n_evaluable": detail["n_evaluable"],
+            "robustness_class": detail["robustness_class"],
         })
 
     robustness_df = pd.DataFrame(robustness_results)
-    counts = robustness_df["robustness"].value_counts()
+    counts = robustness_df["robustness_class"].value_counts()
     print(f"\nRobustness classification:")
     for cls in ["robust", "exploratory", "unstable"]:
         print(f"  {cls.upper()}: {counts.get(cls, 0)}")
+else:
+    print("\nNo FDR-significant findings to stress-test.")
+
+# ==============================================================
+# Decision gates
+# ==============================================================
+# Evaluate each layer's gate with the package's GateEvaluator so the verdict
+# below reflects what actually happened, not what we hoped would happen.
+from types import SimpleNamespace
+from cascade.core import GateEvaluator
+
+evaluator = GateEvaluator(study_type="tropism")
+gates = {
+    "discovery": evaluator.evaluate(
+        "discovery", SimpleNamespace(results=primary_results)
+    ),
+    "confirmation": evaluator.evaluate(
+        "confirmation",
+        SimpleNamespace(results={
+            "direction_concordance": concordance_pct / 100,
+            "n_both_significant": int(n_both),
+        }),
+    ),
+    "sensitivity": evaluator.evaluate(
+        "sensitivity", SimpleNamespace(results=robustness_df)
+    ),
+}
 
 # ==============================================================
 # Summary
@@ -269,4 +301,23 @@ if len(sig_findings) > 0:
     print(f"Layer 4 (Robustness):   {counts.get('robust', 0)} robust / "
           f"{counts.get('exploratory', 0)} exploratory / "
           f"{counts.get('unstable', 0)} unstable")
-print("\nCASCADE validation level: Recommended (Layers 1 + 2 + 4)")
+
+print("\nDecision gates:")
+for name, gate in gates.items():
+    status = "PASS" if gate.passed else "FAIL"
+    detail = f" -- {gate.error_message}" if gate.error_message else ""
+    print(f"  Layer {gate.layer_number} ({name}): {status}{detail}")
+
+# Validation levels (docs/cascade_checklist.md): Minimum = Layers 1 + 4;
+# Recommended additionally needs Layers 2 and 5.  Layer 5 (artifact guards)
+# is not run in this example, so Recommended cannot be reached here.
+if gates["discovery"].passed and gates["sensitivity"].passed:
+    level = "Minimum (Layers 1 + 4 passed)"
+    if gates["confirmation"].passed:
+        level += "; Layer 2 also passed -- run Layer 5 to reach Recommended"
+    else:
+        level += "; Layer 2 gate failed"
+else:
+    failed = [f"Layer {g.layer_number}" for g in gates.values() if not g.passed]
+    level = f"NOT ACHIEVED (failed gate(s): {', '.join(failed)})"
+print(f"\nCASCADE validation level: {level}")

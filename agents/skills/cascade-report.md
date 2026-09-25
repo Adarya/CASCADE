@@ -10,8 +10,8 @@ Generate a comprehensive CASCADE compliance report documenting which validation 
 ## What It Does
 
 1. **Collects** results from all completed CASCADE layers
-2. **Generates layer completion summary** (pass/fail/skipped for each of 9 layers, 0–8)
-3. **Compiles warnings** from all layers (pitfall detections, convergence issues)
+2. **Generates layer completion summary** for each of the 9 layers (0–8). Status reflects the gate outcome: PASS, PASS (remediated), FAIL (gate), FAIL (layer raised), SKIP, or DONE (not gated / gate skipped)
+3. **Compiles warnings** from all layers (pitfall-library warnings from Layer 5, convergence warnings, failed sensitivity variants)
 4. **Fills CASCADE checklist** (26 items across 9 layers, 0–8)
 5. **Computes validation level**: Minimum / Recommended / Comprehensive / Gold Standard
 6. **Generates pitfall audit** section
@@ -28,6 +28,8 @@ Generate a comprehensive CASCADE compliance report documenting which validation 
 
 ```python
 from cascade import Pipeline
+pipeline = Pipeline()  # gates on by default (GateEvaluator('general'));
+                       # pass gate_evaluator=GateEvaluator(study_type=...) or False
 # ... add layers and run ...
 report = pipeline.report()
 with open("cascade_compliance_report.md", "w") as f:
